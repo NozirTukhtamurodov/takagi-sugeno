@@ -2488,34 +2488,148 @@ class DataResult:
 
 
 def load_data(
-    filepath: str,
-    hyper_config: Optional[HyperConfig] = None
+    filepath: str = None,
+    hyper_config: Optional[HyperConfig] = None,
+    config_module = None
 ) -> DataResult:
-    """Загрузка и предобработка данных с опциональным PCA."""
+    """
+    Загрузка и предобработка данных с опциональным PCA.
+    
+    Автоматически определяет:
+    - Количество классов из данных
+    - Имена классов (из config или автоматически)
+    - Количество признаков
+    
+    Args:
+        filepath: Путь к файлу данных (или из config)
+        hyper_config: Конфигурация гиперпараметров
+        config_module: Модуль конфигурации (config.py)
+    """
     from sklearn.decomposition import PCA
+    
+    # Загружаем config если не передан
+    if config_module is None:
+        try:
+            import config as config_module
+        except ImportError:
+            config_module = None
     
     if hyper_config is None:
         hyper_config = HYPER_CONFIG
+    
+    # Получаем параметры из config или используем значения по умолчанию
+    if config_module:
+        filepath = filepath or getattr(config_module, 'DATA_FILE', 'train2.csv')
+        separator = getattr(config_module, 'DATA_SEPARATOR', ';')
+        decimal = getattr(config_module, 'DATA_DECIMAL', ',')
+        has_header = getattr(config_module, 'HAS_HEADER', False)
+        class_start_index = getattr(config_module, 'CLASS_START_INDEX', 1)
+        class_names_config = getattr(config_module, 'CLASS_NAMES', None)
+    else:
+        filepath = filepath or 'train2.csv'
+        separator = ';'
+        decimal = ','
+        has_header = False
+        class_start_index = 1
+        class_names_config = None
     
     # Получаем параметры из конфигурации
     test_size = hyper_config.test_size
     random_state = hyper_config.random_state
     
-    data = pd.read_csv(filepath, sep=';', decimal=',', header=None)
+    # Загрузка данных (поддержка .csv и .txt)
+    header = 0 if has_header else None
+    
+    # Определяем расширение файла
+    file_ext = filepath.lower().split('.')[-1] if '.' in filepath else ''
+    
+    if file_ext in ['csv', 'txt', 'data', 'dat']:
+        # Читаем как текстовый файл с разделителями
+        data = pd.read_csv(
+            filepath, 
+            sep=separator, 
+            decimal=decimal, 
+            header=header,
+            engine='python'  # Более гибкий парсер
+        )
+    else:
+        # Пробуем автоопределение формата
+        data = pd.read_csv(filepath, sep=separator, decimal=decimal, header=header)
+    
     data = data.apply(pd.to_numeric, errors='coerce')
     data = data.fillna(data.mean())
     
+    # Извлечение X и y (последний столбец - всегда классы)
     X = data.iloc[:, :-1].values
-    y = data.iloc[:, -1].values.astype(int) - 1
+    y_raw = data.iloc[:, -1].values
     
-    # Определяем количество классов из данных (max + 1, т.к. индексы с 0)
-    n_classes = int(np.max(y)) + 1
+    # Преобразование классов (учитываем начальный индекс)
+    y = y_raw.astype(int) - class_start_index
+    
+    # Определяем уникальные классы и их количество
+    unique_classes = np.unique(y)
+    n_classes = len(unique_classes)
+    
+    # Создаём маппинг если классы не последовательные
+    if not np.array_equal(unique_classes, np.arange(n_classes)):
+        class_mapping = {old: new for new, old in enumerate(sorted(unique_classes))}
+        y = np.array([class_mapping[c] for c in y])
+        print(f"    ⚠️  Классы переиндексированы: {len(unique_classes)} уникальных классов")
+    
     n_features_original = X.shape[1]
     
-    # Генерируем имена классов динамически
-    class_names = {f"Класс_{i}": i for i in range(n_classes)}
-    class_names_inv = {v: k for k, v in class_names.items()}
+    # Генерируем или загружаем имена классов
+    class_names = {}
+    class_names_inv = {}
     
+    if class_names_config is None:
+        # Автоматическое именование
+        for i in range(n_classes):
+            name = f"Класс_{i}"
+            class_names[name] = i
+            class_names_inv[i] = name
+    elif isinstance(class_names_config, dict):
+        # Словарь {индекс: имя}
+        for idx, name in class_names_config.items():
+            class_names[name] = idx
+            class_names_inv[idx] = name
+        # Добавляем недостающие классы
+        for i in range(n_classes):
+            if i not in class_names_inv:
+                name = f"Класс_{i}"
+                class_names[name] = i
+                class_names_inv[i] = name
+    elif isinstance(class_names_config, list):
+        # Список имён
+        for i, name in enumerate(class_names_config):
+            class_names[name] = i
+            class_names_inv[i] = name
+        # Добавляем недостающие классы
+        for i in range(len(class_names_config), n_classes):
+            name = f"Класс_{i}"
+            class_names[name] = i
+            class_names_inv[i] = name
+    elif isinstance(class_names_config, str):
+        # Путь к файлу с именами классов
+        try:
+            with open(class_names_config, 'r', encoding='utf-8') as f:
+                names = [line.strip() for line in f if line.strip()]
+            for i, name in enumerate(names):
+                class_names[name] = i
+                class_names_inv[i] = name
+            # Добавляем недостающие классы
+            for i in range(len(names), n_classes):
+                name = f"Класс_{i}"
+                class_names[name] = i
+                class_names_inv[i] = name
+        except FileNotFoundError:
+            print(f"    ⚠️  Файл {class_names_config} не найден, используем автоимена")
+            for i in range(n_classes):
+                name = f"Класс_{i}"
+                class_names[name] = i
+                class_names_inv[i] = name
+    
+    # Разделение данных
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
@@ -2561,16 +2675,28 @@ def load_data(
 # ГЛАВНАЯ ФУНКЦИЯ
 # ============================================================================
 
-def main():
-    """Главная точка входа."""
+def main(config_module=None):
+    """
+    Главная точка входа.
+    
+    Args:
+        config_module: Модуль конфигурации (config.py). Если None, загружается автоматически.
+    """
+    # Загружаем config если не передан
+    if config_module is None:
+        try:
+            import config as config_module
+        except ImportError:
+            config_module = None
+    
     print("=" * 70)
     print("ОПТИМИЗИРОВАННЫЙ нечёткий классификатор Такаги-Сугено")
     print("(Векторизация NumPy/SciPy, SOLID, DRY)")
     print("=" * 70)
     
-    # Загрузка данных (с PCA если включен в HYPER_CONFIG)
+    # Загрузка данных (параметры берутся из config автоматически)
     print("\n[1] Загрузка данных...")
-    data_result = load_data("train2.csv", hyper_config=HYPER_CONFIG)
+    data_result = load_data(hyper_config=HYPER_CONFIG, config_module=config_module)
     print(f"    Обучающая: {len(data_result.X_train)}, Тестовая: {len(data_result.X_test)}, "
           f"Признаки: {data_result.n_features}, Классы: {data_result.n_classes}")
     
@@ -2775,13 +2901,31 @@ def main():
     
     # Кросс-валидация (только для одиночной модели)
     print("\n[4] Кросс-валидация...")
-    data = pd.read_csv("train2.csv", sep=';', decimal=',', header=None)
+    
+    # Получаем параметры из config
+    if config_module:
+        data_file = getattr(config_module, 'DATA_FILE', 'train2.csv')
+        separator = getattr(config_module, 'DATA_SEPARATOR', ';')
+        decimal = getattr(config_module, 'DATA_DECIMAL', ',')
+        has_header = getattr(config_module, 'HAS_HEADER', False)
+        class_start_index = getattr(config_module, 'CLASS_START_INDEX', 1)
+        cv_folds = getattr(config_module, 'CV_FOLDS', 5)
+    else:
+        data_file = 'train2.csv'
+        separator = ';'
+        decimal = ','
+        has_header = False
+        class_start_index = 1
+        cv_folds = 5
+    
+    header = 0 if has_header else None
+    data = pd.read_csv(data_file, sep=separator, decimal=decimal, header=header)
     data = data.apply(pd.to_numeric, errors='coerce')
     data = data.fillna(data.mean())
     X_full = StandardScaler().fit_transform(data.iloc[:, :-1].values)
-    y_full = data.iloc[:, -1].values.astype(int) - 1
+    y_full = data.iloc[:, -1].values.astype(int) - class_start_index
     
-    cv_results = model.cross_validate(X_full, y_full, n_folds=5)
+    cv_results = model.cross_validate(X_full, y_full, n_folds=cv_folds)
     print(f"    Точность CV: {cv_results['accuracy_mean']:.4f} ± {cv_results['accuracy_std']:.4f}")
     
     # ========== НЕЙТРОСОФСКИЙ АНСАМБЛЬ ==========

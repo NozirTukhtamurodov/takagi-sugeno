@@ -80,6 +80,46 @@ def show_current_config():
         print(f"   📊 PCA:             {'Вкл (' + str(config.PCA_VARIANCE*100) + '%)' if config.USE_PCA else 'Выкл'}")
         print(f"   📈 Тестовая выборка: {config.TEST_SIZE*100:.0f}%")
         print()
+        
+        # Показываем информацию о данных
+        try:
+            import pandas as pd
+            import numpy as np
+            import os
+            data_file = config.DATA_FILE
+            separator = getattr(config, 'DATA_SEPARATOR', ';')
+            decimal = getattr(config, 'DATA_DECIMAL', ',')
+            has_header = getattr(config, 'HAS_HEADER', False)
+            class_start = getattr(config, 'CLASS_START_INDEX', 1)
+            
+            header = 0 if has_header else None
+            
+            # Определяем engine в зависимости от расширения файла
+            file_ext = os.path.splitext(data_file)[1].lower()
+            if file_ext in ['.txt', '.data', '.dat']:
+                engine = 'python'
+            else:
+                engine = None  # auto
+            
+            data = pd.read_csv(data_file, sep=separator, decimal=decimal, header=header, nrows=100, engine=engine)
+            n_features = data.shape[1] - 1
+            
+            # Читаем только столбец классов для подсчёта
+            data_full = pd.read_csv(data_file, sep=separator, decimal=decimal, header=header, usecols=[data.shape[1]-1], engine=engine)
+            y = data_full.iloc[:, 0].values.astype(int) - class_start
+            # Используем max + 1 для корректного подсчёта (учитываем пропущенные классы)
+            n_classes = int(np.max(y)) + 1
+            n_samples = len(y)
+            
+            print(f"   📊 Данные из файла: {data_file}")
+            print(f"   📈 Примеров:        {n_samples}")
+            print(f"   🔢 Признаков:       {n_features}")
+            print(f"   🏷️  Классов:         {n_classes}")
+            print()
+        except Exception as e:
+            print(f"   ⚠️  Не удалось прочитать данные: {e}")
+            print()
+        
         print(f"   🔧 Функций принадл.: {config.N_MFS}")
         print(f"   📋 Макс. правил:    {config.MAX_RULES}")
         print(f"   🔒 Регуляризация:   {config.REGULARIZATION}")
