@@ -2556,78 +2556,149 @@ def load_data(
         # Пробуем автоопределение формата
         data = pd.read_csv(filepath, sep=separator, decimal=decimal, header=header)
     
-    data = data.apply(pd.to_numeric, errors='coerce')
-    data = data.fillna(data.mean())
+    # === СОХРАНЯЕМ ОРИГИНАЛЬНЫЙ СТОЛБЕЦ КЛАССОВ (до конвертации) ===
+    y_original = data.iloc[:, -1].copy()
+    is_text_classes = not pd.api.types.is_numeric_dtype(y_original)
     
-    # Извлечение X и y (последний столбец - всегда классы)
-    X = data.iloc[:, :-1].values
-    y_raw = data.iloc[:, -1].values
+    if is_text_classes:
+        print(f"    📝 Обнаружены текстовые названия классов")
+        # Создаём маппинг текст -> число
+        unique_labels = sorted(y_original.unique())
+        label_to_idx = {label: idx for idx, label in enumerate(unique_labels)}
+        idx_to_label = {idx: label for label, idx in label_to_idx.items()}
+        print(f"    📋 Найдено {len(unique_labels)} уникальных классов")
     
-    # Преобразование классов (учитываем начальный индекс)
-    y = y_raw.astype(int) - class_start_index
+    # Конвертируем в числовой формат (только признаки, без последнего столбца)
+    data_features = data.iloc[:, :-1].apply(pd.to_numeric, errors='coerce')
     
-    # Определяем уникальные классы и их количество
-    unique_classes = np.unique(y)
-    n_classes = len(unique_classes)
+    # === АНАЛИЗ КАЧЕСТВА ДАННЫХ (только для признаков) ===
+    nan_per_column = data_features.isna().sum()
+    total_nan = nan_per_column.sum()
+    total_cells = data_features.shape[0] * data_features.shape[1]
+    nan_percentage = total_nan / total_cells * 100 if total_cells > 0 else 0
     
-    # Создаём маппинг если классы не последовательные
-    if not np.array_equal(unique_classes, np.arange(n_classes)):
-        class_mapping = {old: new for new, old in enumerate(sorted(unique_classes))}
-        y = np.array([class_mapping[c] for c in y])
-        print(f"    ⚠️  Классы переиндексированы: {len(unique_classes)} уникальных классов")
+    if total_nan > 0:
+        print(f"\n    ⚠️  ОБНАРУЖЕНЫ ПРОБЛЕМЫ С ДАННЫМИ!")
+        print(f"    📊 Всего ячеек: {total_cells}")
+        print(f"    ❌ Некорректных ячеек: {total_nan} ({nan_percentage:.1f}%)")
+        print(f"    📋 Строк с проблемами: {data_features.isna().any(axis=1).sum()}")
+        
+        # Детали по столбцам
+        problem_cols = nan_per_column[nan_per_column > 0]
+        if len(problem_cols) > 0:
+            print(f"\n    Проблемные столбцы:")
+            for col in problem_cols.index:
+                col_nan = problem_cols[col]
+                col_pct = col_nan / len(data) * 100
+                severity = "🔴" if col_pct > 50 else ("🟡" if col_pct > 10 else "🟢")
+                print(f"      {severity} Столбец {col}: {col_nan} NaN ({col_pct:.1f}%)")
+        
+        # Порог критичности
+        if nan_percentage > 20:
+            print(f"\n    🚨 КРИТИЧНО: {nan_percentage:.1f}% данных повреждены!")
+            print(f"    Рекомендация: Исправьте исходный файл данных.")
+            print(f"    Возможные причины:")
+            print(f"      - Неправильная кодировка файла")
+            print(f"      - Смешанные десятичные разделители (точка/запятая)")
+            print(f"      - Повреждение при экспорте из Excel")
+            raise ValueError(f"Слишком много повреждённых данных: {nan_percentage:.1f}% (порог: 20%)")
+        elif nan_percentage > 5:
+            print(f"\n    ⚠️  ВНИМАНИЕ: {nan_percentage:.1f}% данных повреждены!")
+            print(f"    Продолжаю с удалением проблемных строк...")
+            # Находим индексы строк без NaN
+            valid_rows = ~data_features.isna().any(axis=1)
+            data_features = data_features[valid_rows]
+            y_original = y_original[valid_rows]
+            print(f"    Удалено строк: {(~valid_rows).sum()}")
+        else:
+            print(f"\n    ℹ️  Незначительные проблемы ({nan_percentage:.1f}%), удаляю проблемные строки...")
+            valid_rows = ~data_features.isna().any(axis=1)
+            data_features = data_features[valid_rows]
+            y_original = y_original[valid_rows]
+    else:
+        print(f"    ✅ Данные корректны, проблем не обнаружено")
     
-    n_features_original = X.shape[1]
+    # Извлечение X
+    X = data_features.values
     
-    # Генерируем или загружаем имена классов
-    class_names = {}
-    class_names_inv = {}
+    # Обработка классов
+    if is_text_classes:
+        # Текстовые классы -> числа
+        y = np.array([label_to_idx[label] for label in y_original])
+        n_classes = len(unique_labels)
+        
+        # Создаём маппинг имён
+        class_names = {label: idx for label, idx in label_to_idx.items()}
+        class_names_inv = idx_to_label
+        
+        print(f"    ✅ Текстовые классы конвертированы: {n_classes} классов")
+    else:
+        # Числовые классы
+        y_raw = y_original.values
+        y = y_raw.astype(int) - class_start_index
     
-    if class_names_config is None:
-        # Автоматическое именование
-        for i in range(n_classes):
-            name = f"Класс_{i}"
-            class_names[name] = i
-            class_names_inv[i] = name
-    elif isinstance(class_names_config, dict):
-        # Словарь {индекс: имя}
-        for idx, name in class_names_config.items():
-            class_names[name] = idx
-            class_names_inv[idx] = name
-        # Добавляем недостающие классы
-        for i in range(n_classes):
-            if i not in class_names_inv:
-                name = f"Класс_{i}"
-                class_names[name] = i
-                class_names_inv[i] = name
-    elif isinstance(class_names_config, list):
-        # Список имён
-        for i, name in enumerate(class_names_config):
-            class_names[name] = i
-            class_names_inv[i] = name
-        # Добавляем недостающие классы
-        for i in range(len(class_names_config), n_classes):
-            name = f"Класс_{i}"
-            class_names[name] = i
-            class_names_inv[i] = name
-    elif isinstance(class_names_config, str):
-        # Путь к файлу с именами классов
-        try:
-            with open(class_names_config, 'r', encoding='utf-8') as f:
-                names = [line.strip() for line in f if line.strip()]
-            for i, name in enumerate(names):
-                class_names[name] = i
-                class_names_inv[i] = name
-            # Добавляем недостающие классы
-            for i in range(len(names), n_classes):
-                name = f"Класс_{i}"
-                class_names[name] = i
-                class_names_inv[i] = name
-        except FileNotFoundError:
-            print(f"    ⚠️  Файл {class_names_config} не найден, используем автоимена")
+        # Определяем уникальные классы и их количество
+        unique_classes = np.unique(y)
+        n_classes = len(unique_classes)
+        
+        # Создаём маппинг если классы не последовательные
+        if not np.array_equal(unique_classes, np.arange(n_classes)):
+            class_mapping = {old: new for new, old in enumerate(sorted(unique_classes))}
+            y = np.array([class_mapping[c] for c in y])
+            print(f"    ⚠️  Классы переиндексированы: {len(unique_classes)} уникальных классов")
+        
+        # Генерируем или загружаем имена классов
+        class_names = {}
+        class_names_inv = {}
+        
+        if class_names_config is None:
+            # Автоматическое именование
             for i in range(n_classes):
                 name = f"Класс_{i}"
                 class_names[name] = i
                 class_names_inv[i] = name
+        elif isinstance(class_names_config, dict):
+            # Словарь {индекс: имя}
+            for idx, name in class_names_config.items():
+                class_names[name] = idx
+                class_names_inv[idx] = name
+            # Добавляем недостающие классы
+            for i in range(n_classes):
+                if i not in class_names_inv:
+                    name = f"Класс_{i}"
+                    class_names[name] = i
+                    class_names_inv[i] = name
+        elif isinstance(class_names_config, list):
+            # Список имён
+            for i, name in enumerate(class_names_config):
+                class_names[name] = i
+                class_names_inv[i] = name
+            # Добавляем недостающие классы
+            for i in range(len(class_names_config), n_classes):
+                name = f"Класс_{i}"
+                class_names[name] = i
+                class_names_inv[i] = name
+        elif isinstance(class_names_config, str):
+            # Путь к файлу с именами классов
+            try:
+                with open(class_names_config, 'r', encoding='utf-8') as f:
+                    names = [line.strip() for line in f if line.strip()]
+                for i, name in enumerate(names):
+                    class_names[name] = i
+                    class_names_inv[i] = name
+                # Добавляем недостающие классы
+                for i in range(len(names), n_classes):
+                    name = f"Класс_{i}"
+                    class_names[name] = i
+                    class_names_inv[i] = name
+            except FileNotFoundError:
+                print(f"    ⚠️  Файл {class_names_config} не найден, используем автоимена")
+                for i in range(n_classes):
+                    name = f"Класс_{i}"
+                    class_names[name] = i
+                    class_names_inv[i] = name
+    
+    n_features_original = X.shape[1]
     
     # Разделение данных
     X_train, X_test, y_train, y_test = train_test_split(

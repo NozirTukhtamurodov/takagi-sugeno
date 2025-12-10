@@ -7,6 +7,7 @@
 ║    1. python run.py              - использует настройки из config.py         ║
 ║    2. python run.py --interactive - интерактивный режим с меню               ║
 ║    3. python run.py --mode boosting - быстрый выбор режима                   ║
+║    4. python run.py --check      - проверка качества данных                  ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -67,6 +68,145 @@ def print_help():
    Лучше для: задач с большим количеством похожих классов.
 """)
     print("─" * 70)
+
+
+def check_data(verbose: bool = True) -> tuple:
+    """
+    Проверка качества данных.
+    
+    Returns:
+        tuple: (is_ok, nan_percentage, details_dict)
+            - is_ok: True если данные можно использовать
+            - nan_percentage: процент повреждённых ячеек
+            - details: словарь с деталями проблем
+    """
+    import pandas as pd
+    import numpy as np
+    import config
+    
+    data_file = config.DATA_FILE
+    separator = getattr(config, 'DATA_SEPARATOR', ';')
+    decimal = getattr(config, 'DATA_DECIMAL', ',')
+    has_header = getattr(config, 'HAS_HEADER', False)
+    
+    header = 0 if has_header else None
+    
+    # Определяем engine
+    file_ext = os.path.splitext(data_file)[1].lower()
+    engine = 'python' if file_ext in ['.txt', '.data', '.dat'] else None
+    
+    if verbose:
+        print("\n" + "═" * 70)
+        print("🔍 ПРОВЕРКА КАЧЕСТВА ДАННЫХ")
+        print("═" * 70)
+        print(f"   📁 Файл: {data_file}")
+    
+    try:
+        data = pd.read_csv(data_file, sep=separator, decimal=decimal, header=header, engine=engine)
+    except Exception as e:
+        if verbose:
+            print(f"\n   ❌ ОШИБКА: Не удалось прочитать файл!")
+            print(f"      {e}")
+        return False, 100.0, {"error": str(e)}
+    
+    if verbose:
+        print(f"   📊 Размер: {data.shape[0]} строк × {data.shape[1]} столбцов")
+    
+    # Проверяем тип последнего столбца (классы)
+    last_col = data.iloc[:, -1]
+    is_text_classes = not pd.api.types.is_numeric_dtype(last_col)
+    
+    if is_text_classes and verbose:
+        print(f"   📝 Классы: текстовые ({last_col.nunique()} уникальных)")
+    elif verbose:
+        print(f"   🔢 Классы: числовые ({last_col.nunique()} уникальных)")
+    
+    # Конвертируем в числовой формат (ТОЛЬКО признаки, без последнего столбца)
+    data_features = data.iloc[:, :-1].apply(pd.to_numeric, errors='coerce')
+    
+    # Анализ NaN (только для признаков)
+    nan_per_column = data_features.isna().sum()
+    total_nan = nan_per_column.sum()
+    total_cells = data_features.shape[0] * data_features.shape[1]
+    nan_percentage = total_nan / total_cells * 100 if total_cells > 0 else 0
+    rows_with_nan = data_features.isna().any(axis=1).sum()
+    
+    details = {
+        "total_cells": total_cells,
+        "total_nan": total_nan,
+        "nan_percentage": nan_percentage,
+        "rows_with_nan": rows_with_nan,
+        "problem_columns": {},
+        "is_text_classes": is_text_classes
+    }
+    
+    if verbose:
+        print(f"\n   📈 РЕЗУЛЬТАТЫ ПРОВЕРКИ:")
+        print(f"   ────────────────────────────────────────")
+    
+    if total_nan == 0:
+        if verbose:
+            print(f"   ✅ ОТЛИЧНО! Все данные корректны.")
+            print(f"   ✅ Можно начинать обучение.")
+        return True, 0.0, details
+    
+    # Есть проблемы
+    if verbose:
+        print(f"   ⚠️  Всего ячеек:        {total_cells}")
+        print(f"   ❌ Некорректных:        {total_nan} ({nan_percentage:.2f}%)")
+        print(f"   📋 Строк с проблемами:  {rows_with_nan}")
+    
+    # Детали по столбцам
+    problem_cols = nan_per_column[nan_per_column > 0]
+    if len(problem_cols) > 0 and verbose:
+        print(f"\n   📊 ПРОБЛЕМНЫЕ СТОЛБЦЫ:")
+        print(f"   ────────────────────────────────────────")
+        
+    for col in problem_cols.index:
+        col_nan = problem_cols[col]
+        col_pct = col_nan / len(data) * 100
+        details["problem_columns"][col] = {"nan": col_nan, "percent": col_pct}
+        
+        if verbose:
+            if col_pct > 50:
+                severity = "🔴 КРИТИЧНО"
+            elif col_pct > 10:
+                severity = "🟡 ВНИМАНИЕ"
+            else:
+                severity = "🟢 Незначит."
+            print(f"      Столбец {col:2d}: {col_nan:5d} NaN ({col_pct:5.1f}%) {severity}")
+    
+    # Вердикт
+    if verbose:
+        print(f"\n   📋 ВЕРДИКТ:")
+        print(f"   ────────────────────────────────────────")
+    
+    if nan_percentage > 20:
+        if verbose:
+            print(f"   🚨 КРИТИЧНО: {nan_percentage:.1f}% данных повреждены!")
+            print(f"   ❌ ОБУЧЕНИЕ ЗАБЛОКИРОВАНО")
+            print(f"\n   💡 РЕКОМЕНДАЦИИ:")
+            print(f"      1. Проверьте исходный файл данных")
+            print(f"      2. Возможные причины:")
+            print(f"         - Неправильная кодировка файла")
+            print(f"         - Смешанные десятичные разделители")
+            print(f"         - Повреждение при экспорте из Excel")
+            print(f"      3. Исправьте файл и запустите проверку снова:")
+            print(f"         python run.py --check")
+        return False, nan_percentage, details
+    
+    elif nan_percentage > 5:
+        if verbose:
+            print(f"   ⚠️  ВНИМАНИЕ: {nan_percentage:.1f}% данных повреждены.")
+            print(f"   ⚠️  Проблемные строки будут удалены при обучении.")
+            print(f"   ✅ Обучение возможно, но рекомендуется исправить данные.")
+        return True, nan_percentage, details
+    
+    else:
+        if verbose:
+            print(f"   ℹ️  Незначительные проблемы: {nan_percentage:.2f}%")
+            print(f"   ✅ Обучение возможно (проблемные строки будут удалены)")
+        return True, nan_percentage, details
 
 
 def show_current_config():
@@ -176,7 +316,21 @@ def update_config_mode(mode: str):
 
 def run_classifier():
     """Запуск классификатора с текущей конфигурацией."""
-    print("\n🔄 Загрузка классификатора...")
+    
+    # ===== ПРОВЕРКА ДАННЫХ ПЕРЕД ОБУЧЕНИЕМ =====
+    print("\n🔄 Проверка данных перед обучением...")
+    is_ok, nan_pct, details = check_data(verbose=True)
+    
+    if not is_ok:
+        print("\n" + "═" * 70)
+        print("❌ ОБУЧЕНИЕ ОТМЕНЕНО: данные не прошли проверку!")
+        print("═" * 70)
+        print("\n💡 Исправьте данные и запустите снова.")
+        return False
+    
+    print("\n" + "═" * 70)
+    print("✅ Данные проверены, начинаю обучение...")
+    print("═" * 70)
     
     # Перезагружаем конфиг
     import importlib
@@ -297,6 +451,12 @@ def main():
     )
     
     parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Проверить качество данных (без обучения)"
+    )
+    
+    parser.add_argument(
         "--no-plots",
         action="store_true",
         help="Не генерировать графики"
@@ -309,6 +469,18 @@ def main():
         print_banner()
         show_current_config()
         sys.exit(0)
+    
+    # Проверка данных
+    if args.check:
+        print_banner()
+        is_ok, nan_pct, details = check_data(verbose=True)
+        print("\n" + "═" * 70)
+        if is_ok:
+            print("✅ Можно запускать обучение: python run.py")
+        else:
+            print("❌ Исправьте данные перед обучением!")
+        print("═" * 70)
+        sys.exit(0 if is_ok else 1)
     
     # Интерактивный режим
     if args.interactive:
