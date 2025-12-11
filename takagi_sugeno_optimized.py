@@ -302,10 +302,20 @@ def generate_dynamic_intervals(
 
 
 def one_hot_encode(y: np.ndarray, n_classes: int) -> np.ndarray:
-    """Векторизованное one-hot кодирование."""
+    """Векторизованное one-hot кодирование с защитой от выхода за границы."""
     n_samples = len(y)
+    y_int = y.astype(int)
+    
+    # Защита: проверяем границы
+    max_idx = y_int.max()
+    if max_idx >= n_classes:
+        raise ValueError(
+            f"Ошибка one_hot_encode: max(y)={max_idx} >= n_classes={n_classes}. "
+            f"Проверьте переиндексацию классов! Уникальные y: {np.unique(y_int)[:20]}..."
+        )
+    
     one_hot = np.zeros((n_samples, n_classes), dtype=np.float64)
-    one_hot[np.arange(n_samples), y.astype(int)] = 1.0
+    one_hot[np.arange(n_samples), y_int] = 1.0
     return one_hot
 
 
@@ -2540,6 +2550,23 @@ def load_data(
     # Загрузка данных (поддержка .csv и .txt)
     header = 0 if has_header else None
     
+    # Автоопределение кодировки
+    encoding = None
+    try:
+        with open(filepath, 'rb') as f:
+            first_bytes = f.read(4)
+            if first_bytes[:2] == b'\xff\xfe':
+                encoding = 'utf-16-le'
+                print(f"    📝 Обнаружена кодировка: UTF-16 LE")
+            elif first_bytes[:2] == b'\xfe\xff':
+                encoding = 'utf-16-be'
+                print(f"    📝 Обнаружена кодировка: UTF-16 BE")
+            elif first_bytes[:3] == b'\xef\xbb\xbf':
+                encoding = 'utf-8-sig'
+                print(f"    📝 Обнаружена кодировка: UTF-8 BOM")
+    except:
+        pass
+    
     # Определяем расширение файла
     file_ext = filepath.lower().split('.')[-1] if '.' in filepath else ''
     
@@ -2550,11 +2577,12 @@ def load_data(
             sep=separator, 
             decimal=decimal, 
             header=header,
-            engine='python'  # Более гибкий парсер
+            engine='python',  # Более гибкий парсер
+            encoding=encoding
         )
     else:
         # Пробуем автоопределение формата
-        data = pd.read_csv(filepath, sep=separator, decimal=decimal, header=header)
+        data = pd.read_csv(filepath, sep=separator, decimal=decimal, header=header, encoding=encoding)
     
     # === СОХРАНЯЕМ ОРИГИНАЛЬНЫЙ СТОЛБЕЦ КЛАССОВ (до конвертации) ===
     y_original = data.iloc[:, -1].copy()
@@ -2982,19 +3010,11 @@ def main(config_module=None):
         class_start_index = getattr(config_module, 'CLASS_START_INDEX', 1)
         cv_folds = getattr(config_module, 'CV_FOLDS', 5)
     else:
-        data_file = 'train2.csv'
-        separator = ';'
-        decimal = ','
-        has_header = False
-        class_start_index = 1
         cv_folds = 5
     
-    header = 0 if has_header else None
-    data = pd.read_csv(data_file, sep=separator, decimal=decimal, header=header)
-    data = data.apply(pd.to_numeric, errors='coerce')
-    data = data.fillna(data.mean())
-    X_full = StandardScaler().fit_transform(data.iloc[:, :-1].values)
-    y_full = data.iloc[:, -1].values.astype(int) - class_start_index
+    # Используем уже загруженные и переиндексированные данные
+    X_full = np.vstack([data_result.X_train, data_result.X_test])
+    y_full = np.concatenate([data_result.y_train, data_result.y_test])
     
     cv_results = model.cross_validate(X_full, y_full, n_folds=cv_folds)
     print(f"    Точность CV: {cv_results['accuracy_mean']:.4f} ± {cv_results['accuracy_std']:.4f}")
