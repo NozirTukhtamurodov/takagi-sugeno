@@ -95,14 +95,30 @@ def check_data(verbose: bool = True) -> tuple:
     file_ext = os.path.splitext(data_file)[1].lower()
     engine = 'python' if file_ext in ['.txt', '.data', '.dat'] else None
     
+    # Автоопределение кодировки
+    encoding = None
+    try:
+        with open(data_file, 'rb') as f:
+            first_bytes = f.read(4)
+            if first_bytes[:2] == b'\xff\xfe':
+                encoding = 'utf-16-le'
+            elif first_bytes[:2] == b'\xfe\xff':
+                encoding = 'utf-16-be'
+            elif first_bytes[:3] == b'\xef\xbb\xbf':
+                encoding = 'utf-8-sig'
+    except:
+        pass
+    
     if verbose:
         print("\n" + "═" * 70)
         print("🔍 ПРОВЕРКА КАЧЕСТВА ДАННЫХ")
+        if encoding:
+            print(f"   📝 Кодировка: {encoding}")
         print("═" * 70)
         print(f"   📁 Файл: {data_file}")
     
     try:
-        data = pd.read_csv(data_file, sep=separator, decimal=decimal, header=header, engine=engine)
+        data = pd.read_csv(data_file, sep=separator, decimal=decimal, header=header, engine=engine, encoding=encoding)
     except Exception as e:
         if verbose:
             print(f"\n   ❌ ОШИБКА: Не удалось прочитать файл!")
@@ -241,15 +257,34 @@ def show_current_config():
             else:
                 engine = None  # auto
             
-            data = pd.read_csv(data_file, sep=separator, decimal=decimal, header=header, nrows=100, engine=engine)
+            # Автоопределение кодировки
+            encoding = None
+            try:
+                with open(data_file, 'rb') as f:
+                    first_bytes = f.read(4)
+                    if first_bytes[:2] == b'\xff\xfe':
+                        encoding = 'utf-16-le'
+                    elif first_bytes[:2] == b'\xfe\xff':
+                        encoding = 'utf-16-be'
+                    elif first_bytes[:3] == b'\xef\xbb\xbf':
+                        encoding = 'utf-8-sig'
+            except:
+                pass
+            
+            data = pd.read_csv(data_file, sep=separator, decimal=decimal, header=header, nrows=100, engine=engine, encoding=encoding)
             n_features = data.shape[1] - 1
             
             # Читаем только столбец классов для подсчёта
-            data_full = pd.read_csv(data_file, sep=separator, decimal=decimal, header=header, usecols=[data.shape[1]-1], engine=engine)
-            y = data_full.iloc[:, 0].values.astype(int) - class_start
-            # Используем max + 1 для корректного подсчёта (учитываем пропущенные классы)
-            n_classes = int(np.max(y)) + 1
-            n_samples = len(y)
+            data_full = pd.read_csv(data_file, sep=separator, decimal=decimal, header=header, usecols=[data.shape[1]-1], engine=engine, encoding=encoding)
+            
+            # Проверяем тип классов (текст или число)
+            last_col = data_full.iloc[:, 0]
+            if pd.api.types.is_numeric_dtype(last_col):
+                y = last_col.values.astype(int) - class_start
+                n_classes = int(np.max(y)) + 1
+            else:
+                n_classes = last_col.nunique()
+            n_samples = len(data_full)
             
             print(f"   📊 Данные из файла: {data_file}")
             print(f"   📈 Примеров:        {n_samples}")
