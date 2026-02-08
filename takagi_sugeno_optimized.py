@@ -29,6 +29,7 @@ from sklearn.metrics import (
     precision_score, recall_score, roc_curve, auc, precision_recall_curve
 )
 import joblib
+import pickle
 from typing import Tuple, Optional, Dict, List, Protocol, Any
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -197,22 +198,22 @@ class HyperConfig:
 
 # Глобальная конфигурация гиперпараметров (изменяйте здесь для настройки)
 HYPER_CONFIG = HyperConfig(
-    n_mfs_min=5,
-    n_mfs_max=9,            # Увеличено для лучшего разделения
-    n_mfs_divisor=12,       # Уменьшено для большего n_mfs
-    max_rules_min=400,      # Увеличено минимум правил
-    max_rules_max=600,      # Увеличено максимум правил
-    max_rules_multiplier=4, # Увеличено для многоклассовой задачи
-    regularization=0.0005,  # Ещё меньше регуляризация
-    temperature=0.2,        # Ещё меньше температура (резче решения)
-    overlap_factor=3.0,     # Увеличено перекрытие ФП
+    n_mfs_min=3,
+    n_mfs_max=5,            # 3-5 ФП достаточно для малого числа классов
+    n_mfs_divisor=20,       # Стандартный делитель
+    max_rules_min=30,       # Разумный минимум для 4 классов
+    max_rules_max=100,      # Разумный максимум (не больше кол-ва образцов)
+    max_rules_multiplier=10, # ~40 правил для 4 классов
+    regularization=0.01,    # Стандартная регуляризация
+    temperature=0.5,        # Умеренная температура softmax
+    overlap_factor=1.5,     # Стандартное перекрытие ФП
     multiclass_threshold=50,
     # PCA параметры
     use_pca=False,          # Отключить PCA - сохраняем все признаки
-    pca_variance=0.99,      # 99% дисперсии
+    pca_variance=0.95,      # 95% дисперсии
     pca_n_components=None,  # Авто-выбор компонент
     # Разделение данных
-    test_size=0.1,          # 10% тестовая выборка
+    test_size=0.2,          # 20% тестовая выборка (80 образцов — надёжнее)
     random_state=42,
     # Ансамбль
     use_ensemble=False,     # Отключить ансамбль
@@ -222,9 +223,9 @@ HYPER_CONFIG = HyperConfig(
     use_hierarchical=False, # Отключить иерархическую классификацию
     n_groups=10,            # 10 групп на первом уровне
     # Бустинг
-    use_boosting=True,      # Включить бустинг
-    n_boosting_rounds=10,   # 10 раундов бустинга (увеличено)
-    boosting_learning_rate=0.5  # Увеличена скорость обучения
+    use_boosting=False,     # Отключить бустинг (не нужен для 4 классов)
+    n_boosting_rounds=5,    # Количество раундов бустинга
+    boosting_learning_rate=0.3  # Скорость обучения бустинга
 )
 
 
@@ -976,67 +977,95 @@ class TakagiSugenoClassifier:
         return descriptions
     
     def save_model(self, path: str) -> None:
-        """Сохранение модели в файл."""
+        """
+        Сохранение модели в файл (чистый pickle формат).
+        
+        Сохраняется plain-словарь с numpy-массивами и базовыми типами,
+        без ссылок на пользовательские классы — файл можно загрузить
+        в любом окружении (API-сервер и т.д.) без модуля takagi_sugeno_optimized.
+        """
         if not self.is_fitted:
             raise RuntimeError("Нельзя сохранить необученную модель.")
         
+        # Сериализация partitions в списки (plain data)
+        partitions_data = []
+        for p in self.partitions:
+            partitions_data.append({
+                'n_mfs': int(p.n_mfs),
+                'min_val': float(p.min_val),
+                'max_val': float(p.max_val),
+                'centers': p.centers.tolist(),
+                'sigmas': p.sigmas.tolist(),
+            })
+        
+        # Нейтрософские интервалы (если есть)
+        neutrosophic_intervals = None
+        use_neutrosophic = self.config.use_neutrosophic
+        if use_neutrosophic and self.neutrosophic_handler is not None:
+            neutrosophic_intervals = self.neutrosophic_handler.intervals.tolist()
+        
         save_dict = {
-            'config': {
-                'n_inputs': self._actual_n_inputs,
-                'n_classes': self.config.n_classes,
-                'n_mfs': self.config.n_mfs,
-                'regularization': self.config.regularization,
-                'temperature': self.config.temperature,
-                'use_neutrosophic': self.config.use_neutrosophic,
-                'dynamic_neutrosophic': self.config.dynamic_neutrosophic,
-                'max_rules': self.config.max_rules,
-                'overlap_factor': self.config.overlap_factor
-            },
-            'partitions': [p.to_dict() for p in self.partitions],
-            'rule_indices': self.rule_indices,
-            'consequent_params': self.consequent_params,
-            'mins': self.mins,
-            'maxs': self.maxs,
-            'scaler': self.scaler,
-            'neutrosophic_intervals': (
-                self.neutrosophic_handler.intervals 
-                if self.neutrosophic_handler else None
-            )
+            # Конфигурация
+            'n_inputs': int(self._actual_n_inputs),
+            'n_classes': int(self.config.n_classes),
+            'n_mfs': int(self.config.n_mfs),
+            'temperature': float(self.config.temperature),
+            'use_neutrosophic': bool(use_neutrosophic),
+            # Параметры модели (numpy -> list для чистого pickle)
+            'partitions': partitions_data,
+            'rule_indices': self.rule_indices.tolist(),
+            'consequent_params': self.consequent_params.tolist(),
+            # Границы данных
+            'mins': self.mins.tolist(),
+            'maxs': self.maxs.tolist(),
+            # Нейтрософские интервалы
+            'neutrosophic_intervals': neutrosophic_intervals,
+            # Scaler параметры (если есть)
+            'scaler_mean': self.scaler.mean_.tolist() if self.scaler is not None else None,
+            'scaler_scale': self.scaler.scale_.tolist() if self.scaler is not None else None,
         }
         
-        joblib.dump(save_dict, path)
+        with open(path, 'wb') as f:
+            pickle.dump(save_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
         print(f"Модель сохранена в {path}")
     
     @classmethod
     def load_model(cls, path: str) -> 'TakagiSugenoClassifier':
-        """Загрузка модели из файла."""
-        save_dict = joblib.load(path)
-        cfg = save_dict['config']
+        """Загрузка модели из файла (чистый pickle формат)."""
+        with open(path, 'rb') as f:
+            save_dict = pickle.load(f)
         
         config = ModelConfig(
-            n_inputs=cfg['n_inputs'],
-            n_classes=cfg['n_classes'],
-            n_mfs=cfg['n_mfs'],
-            regularization=cfg.get('regularization', 0.01),
-            temperature=cfg.get('temperature', 1.0),
-            use_neutrosophic=cfg.get('use_neutrosophic', False),
-            dynamic_neutrosophic=cfg.get('dynamic_neutrosophic', True),
-            max_rules=cfg.get('max_rules', 150),
-            overlap_factor=cfg.get('overlap_factor', 1.5)
+            n_inputs=save_dict['n_inputs'],
+            n_classes=save_dict['n_classes'],
+            n_mfs=save_dict['n_mfs'],
+            temperature=save_dict.get('temperature', 1.0),
+            use_neutrosophic=save_dict.get('use_neutrosophic', False),
         )
         
         model = cls(config=config)
-        model._actual_n_inputs = cfg['n_inputs']
+        model._actual_n_inputs = save_dict['n_inputs']
         model.partitions = [FuzzyPartition.from_dict(p) for p in save_dict['partitions']]
-        model.rule_indices = save_dict['rule_indices']
-        model.consequent_params = save_dict['consequent_params']
-        model.mins = save_dict['mins']
-        model.maxs = save_dict['maxs']
-        model.scaler = save_dict['scaler']
+        model.rule_indices = np.array(save_dict['rule_indices'], dtype=np.int32)
+        model.consequent_params = np.array(save_dict['consequent_params'], dtype=np.float64)
+        model.mins = np.array(save_dict['mins'], dtype=np.float64)
+        model.maxs = np.array(save_dict['maxs'], dtype=np.float64)
         
-        # Restore neutrosophic handler
+        # Восстановление scaler
+        if save_dict.get('scaler_mean') is not None:
+            from sklearn.preprocessing import StandardScaler
+            scaler = StandardScaler()
+            scaler.mean_ = np.array(save_dict['scaler_mean'])
+            scaler.scale_ = np.array(save_dict['scaler_scale'])
+            scaler.var_ = scaler.scale_ ** 2
+            scaler.n_features_in_ = len(scaler.mean_)
+            model.scaler = scaler
+        
+        # Восстановление нейтрософского обработчика
         if config.use_neutrosophic and save_dict.get('neutrosophic_intervals') is not None:
-            neutro_config = NeutrosophicConfig(intervals=save_dict['neutrosophic_intervals'])
+            neutro_config = NeutrosophicConfig(
+                intervals=np.array(save_dict['neutrosophic_intervals'])
+            )
             model.neutrosophic_handler = NeutrosophicHandler(neutro_config)
             model.firing_strategy = NeutrosophicFiringStrategy(model.neutrosophic_handler)
         else:
@@ -1735,8 +1764,6 @@ class ModelVisualizer:
             ax.set_yticks(np.arange(0, n_classes_actual, 10))
             ax.set_yticklabels(np.arange(0, n_classes_actual, 10), rotation=0, fontsize=8)
         
-        plt.tight_layout()
-        
         if save_path:
             fig.savefig(save_path, dpi=self.save_dpi, bbox_inches='tight')
             print(f"Сохранено: {save_path}")
@@ -1803,7 +1830,9 @@ class ModelVisualizer:
         ax.legend(loc='lower right', fontsize=9)
         ax.grid(True, alpha=0.3)
         
-        plt.tight_layout()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            plt.tight_layout()
         
         if save_path:
             fig.savefig(save_path, dpi=self.save_dpi, bbox_inches='tight')
@@ -1861,7 +1890,9 @@ class ModelVisualizer:
         ax.legend(loc='lower left', fontsize=9)
         ax.grid(True, alpha=0.3)
         
-        plt.tight_layout()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            plt.tight_layout()
         
         if save_path:
             fig.savefig(save_path, dpi=self.save_dpi, bbox_inches='tight')
@@ -1959,7 +1990,9 @@ class ModelVisualizer:
             
             fig.suptitle(title, fontsize=14, fontweight='bold')
         
-        plt.tight_layout()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            plt.tight_layout()
         
         if save_path:
             fig.savefig(save_path, dpi=self.save_dpi, bbox_inches='tight')
@@ -2026,7 +2059,9 @@ class ModelVisualizer:
             axes[1].grid(True, alpha=0.3, axis='y')
         
         fig.suptitle(title, fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            plt.tight_layout()
         
         if save_path:
             fig.savefig(save_path, dpi=self.save_dpi, bbox_inches='tight')
@@ -2093,7 +2128,9 @@ class ModelVisualizer:
         axes[1].grid(True, alpha=0.3, axis='y')
         
         fig.suptitle(title, fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            plt.tight_layout()
         
         if save_path:
             fig.savefig(save_path, dpi=self.save_dpi, bbox_inches='tight')
@@ -2116,11 +2153,14 @@ class ModelVisualizer:
         x = np.arange(len(metrics))
         width = 0.8 / len(model_names)
         
+        # Контрастные цвета для сравнения моделей
+        comparison_colors = ['#2ecc71', '#e74c3c', '#3498db', '#f39c12', '#9b59b6', '#1abc9c']
+        
         for i, (model_name, results) in enumerate(model_results.items()):
             values = [results[m] for m in metrics]
             offset = (i - len(model_names)/2 + 0.5) * width
             bars = ax.bar(x + offset, values, width, label=model_name, 
-                         color=self.colors[i % len(self.colors)])
+                         color=comparison_colors[i % len(comparison_colors)])
             
             for bar, val in zip(bars, values):
                 ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
@@ -2134,7 +2174,9 @@ class ModelVisualizer:
         ax.legend(loc='upper right')
         ax.grid(True, alpha=0.3, axis='y')
         
-        plt.tight_layout()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            plt.tight_layout()
         
         if save_path:
             import os
@@ -2144,6 +2186,200 @@ class ModelVisualizer:
         
         return fig
     
+    def plot_architecture_info(
+        self,
+        hyper_config: 'HyperConfig',
+        model_config: 'ModelConfig',
+        data_info: Dict[str, any],
+        training_results: Dict[str, float],
+        title: str = "Архитектура и гиперпараметры модели",
+        save_path: Optional[str] = None
+    ) -> plt.Figure:
+        """
+        Визуализация архитектуры модели и гиперпараметров.
+        
+        Args:
+            hyper_config: Конфигурация гиперпараметров
+            model_config: Конфигурация модели
+            data_info: Информация о данных {'n_samples', 'n_features', 'n_classes', 'train_size', 'test_size'}
+            training_results: Результаты обучения {'accuracy', 'f1', 'cv_accuracy', 'cv_std'}
+            title: Заголовок графика
+            save_path: Путь для сохранения
+        """
+        fig = plt.figure(figsize=(16, 12))
+        gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
+        
+        # ========== 1. АРХИТЕКТУРА (верхний левый) ==========
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax1.axis('off')
+        
+        # Определяем тип архитектуры
+        if hyper_config.use_boosting:
+            arch_type = "БУСТИНГ"
+            arch_color = '#e74c3c'
+            arch_details = [
+                f"Раундов: {hyper_config.n_boosting_rounds}",
+                f"Скорость обучения: {hyper_config.boosting_learning_rate}",
+                "Адаптивное взвешивание"
+            ]
+        elif hyper_config.use_hierarchical:
+            arch_type = "ИЕРАРХИЧЕСКАЯ"
+            arch_color = '#9b59b6'
+            arch_details = [
+                f"Групп: {hyper_config.n_groups}",
+                "Двухуровневая классификация",
+                "K-Means кластеризация"
+            ]
+        elif hyper_config.use_ensemble:
+            arch_type = "АНСАМБЛЬ"
+            arch_color = '#3498db'
+            arch_details = [
+                f"Моделей: {hyper_config.n_estimators}",
+                f"Разнообразие: {'Да' if hyper_config.ensemble_diversity else 'Нет'}",
+                "Голосование большинством"
+            ]
+        else:
+            arch_type = "ОДИНОЧНАЯ"
+            arch_color = '#2ecc71'
+            arch_details = [
+                "Базовый Такаги-Сугено",
+                "Без ансамблирования",
+                "Прямой вывод"
+            ]
+        
+        # Нейтрософская логика
+        neutro_status = "Нейтрософская" if model_config.use_neutrosophic else "Классическая"
+        
+        # Рисуем блок архитектуры как список
+        ax1.text(0.5, 0.75, arch_type, transform=ax1.transAxes, fontsize=20,
+                ha='center', va='center', fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.4', facecolor=arch_color, alpha=0.3))
+        
+        details_text = f"{arch_details[0]}\n{arch_details[1]}\n{arch_details[2]}\n\nЛогика: {neutro_status}"
+        ax1.text(0.5, 0.35, details_text, transform=ax1.transAxes, fontsize=12,
+                ha='center', va='center',
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8))
+        ax1.set_title('Архитектура', fontsize=14, fontweight='bold', pad=10)
+        
+        # ========== 2. ГИПЕРПАРАМЕТРЫ (верхний правый) ==========
+        ax2 = fig.add_subplot(gs[0, 1])
+        ax2.axis('off')
+        
+        params = [
+            ("Функции принадлежности", f"{model_config.n_mfs}"),
+            ("Макс. правил", f"{model_config.max_rules}"),
+            ("Регуляризация", f"{model_config.regularization}"),
+            ("Температура", f"{model_config.temperature}"),
+            ("Перекрытие ФП", f"{model_config.overlap_factor}"),
+            ("PCA", f"{'Да (' + str(int(hyper_config.pca_variance*100)) + '%)' if hyper_config.use_pca else 'Нет'}"),
+            ("Тест. выборка", f"{int(hyper_config.test_size*100)}%"),
+            ("Random seed", f"{hyper_config.random_state}"),
+        ]
+        
+        table_data = [[p[0], p[1]] for p in params]
+        table = ax2.table(cellText=table_data, colLabels=['Параметр', 'Значение'],
+                         loc='center', cellLoc='center',
+                         colWidths=[0.6, 0.4])
+        table.auto_set_font_size(False)
+        table.set_fontsize(11)
+        table.scale(1.2, 1.8)
+        
+        # Цвета для таблицы
+        for i in range(len(params) + 1):
+            for j in range(2):
+                cell = table[(i, j)]
+                if i == 0:  # Заголовок
+                    cell.set_facecolor('#34495e')
+                    cell.set_text_props(color='white', fontweight='bold')
+                else:
+                    cell.set_facecolor('#ecf0f1' if i % 2 == 0 else 'white')
+        
+        ax2.set_title('Гиперпараметры', fontsize=14, fontweight='bold', pad=10)
+        
+        # ========== 3. ДАННЫЕ (нижний левый) ==========
+        ax3 = fig.add_subplot(gs[1, 0])
+        
+        # Круговая диаграмма train/test
+        train_pct = 100 - int(hyper_config.test_size * 100)
+        test_pct = int(hyper_config.test_size * 100)
+        sizes = [train_pct, test_pct]
+        labels = [f'Обучение\n{data_info.get("train_size", "N/A")} примеров\n({train_pct}%)',
+                  f'Тест\n{data_info.get("test_size", "N/A")} примеров\n({test_pct}%)']
+        colors_pie = ['#2ecc71', '#e74c3c']
+        explode = (0.02, 0.02)
+        
+        wedges, texts, autotexts = ax3.pie(sizes, explode=explode, labels=labels, colors=colors_pie,
+                                           autopct='', startangle=90, 
+                                           wedgeprops=dict(width=0.5, edgecolor='white'))
+        
+        # Центральный текст
+        centre_text = f"Всего\n{data_info.get('n_samples', 'N/A')}\nпримеров"
+        ax3.text(0, 0, centre_text, ha='center', va='center', fontsize=12, fontweight='bold')
+        
+        # Информация о данных справа
+        data_text = f"""
+Признаков: {data_info.get('n_features', 'N/A')}
+Классов: {data_info.get('n_classes', 'N/A')}
+Правил: {len(model_config.max_rules) if hasattr(model_config.max_rules, '__len__') else model_config.max_rules}
+"""
+        ax3.text(1.3, 0, data_text.strip(), ha='left', va='center', fontsize=11,
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.8))
+        
+        ax3.set_title('Данные', fontsize=14, fontweight='bold', pad=10)
+        
+        # ========== 4. РЕЗУЛЬТАТЫ (нижний правый) ==========
+        ax4 = fig.add_subplot(gs[1, 1])
+        
+        metrics_names = ['Точность\n(Тест)', 'F1-мера\n(Тест)', 'CV Точность', 'CV СКО']
+        metrics_values = [
+            training_results.get('accuracy', 0),
+            training_results.get('f1', 0),
+            training_results.get('cv_accuracy', 0),
+            training_results.get('cv_std', 0)
+        ]
+        
+        # Цвета в зависимости от значения
+        bar_colors = []
+        for i, v in enumerate(metrics_values):
+            if i == 3:  # CV std - меньше лучше
+                bar_colors.append('#2ecc71' if v < 0.05 else '#f39c12' if v < 0.1 else '#e74c3c')
+            else:
+                bar_colors.append('#2ecc71' if v >= 0.8 else '#f39c12' if v >= 0.6 else '#e74c3c')
+        
+        x_pos = np.arange(len(metrics_names))
+        bars = ax4.bar(x_pos, metrics_values, color=bar_colors, edgecolor='black', alpha=0.8)
+        
+        # Значения над столбцами
+        for bar, val in zip(bars, metrics_values):
+            ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                    f'{val:.4f}', ha='center', va='bottom', fontsize=11, fontweight='bold')
+        
+        ax4.set_xticks(x_pos)
+        ax4.set_xticklabels(metrics_names, fontsize=10)
+        ax4.set_ylim([0, 1.15])
+        ax4.set_ylabel('Значение', fontsize=11)
+        ax4.set_title('Результаты обучения', fontsize=14, fontweight='bold', pad=10)
+        ax4.grid(True, alpha=0.3, axis='y')
+        
+        # Легенда цветов
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='#2ecc71', label='Отлично (>=80%)'),
+            Patch(facecolor='#f39c12', label='Средне (60-80%)'),
+            Patch(facecolor='#e74c3c', label='Низко (<60%)')
+        ]
+        ax4.legend(handles=legend_elements, loc='upper right', fontsize=9)
+        
+        fig.suptitle(title, fontsize=16, fontweight='bold')
+        
+        if save_path:
+            import os
+            os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else '.', exist_ok=True)
+            fig.savefig(save_path, dpi=self.save_dpi, bbox_inches='tight')
+            print(f"Сохранено: {save_path}")
+        
+        return fig
+
     def plot_membership_functions(
         self,
         partition: 'FuzzyPartition',
@@ -2176,7 +2412,9 @@ class ModelVisualizer:
         ax.set_ylim([0, 1.05])
         ax.grid(True, alpha=0.3)
         
-        plt.tight_layout()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            plt.tight_layout()
         
         if save_path:
             fig.savefig(save_path, dpi=self.save_dpi, bbox_inches='tight')
@@ -2393,7 +2631,9 @@ class ModelVisualizer:
         ax4.grid(True, alpha=0.3, axis='y')
         
         fig.suptitle(title, fontsize=14, fontweight='bold')
-        plt.tight_layout()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            plt.tight_layout()
         
         if save_path:
             fig.savefig(save_path, dpi=self.save_dpi, bbox_inches='tight')
@@ -2669,20 +2909,28 @@ def load_data(
         unique_classes = np.unique(y)
         n_classes = len(unique_classes)
         
+        # Сохраняем оригинальные номера классов (до переиндексации)
+        original_class_labels = [c + class_start_index for c in sorted(unique_classes)]  # Возвращаем к оригинальным номерам
+        
         # Создаём маппинг если классы не последовательные
         if not np.array_equal(unique_classes, np.arange(n_classes)):
             class_mapping = {old: new for new, old in enumerate(sorted(unique_classes))}
+            # Обратный маппинг: внутренний индекс -> оригинальный номер (с учётом class_start_index)
+            reverse_mapping = {new: old + class_start_index for old, new in class_mapping.items()}
             y = np.array([class_mapping[c] for c in y])
             print(f"    ⚠️  Классы переиндексированы: {len(unique_classes)} уникальных классов")
+        else:
+            reverse_mapping = {i: i + class_start_index for i in range(n_classes)}
         
         # Генерируем или загружаем имена классов
         class_names = {}
         class_names_inv = {}
         
         if class_names_config is None:
-            # Автоматическое именование
+            # Автоматическое именование с ОРИГИНАЛЬНЫМИ номерами классов
             for i in range(n_classes):
-                name = f"Класс_{i}"
+                original_label = reverse_mapping.get(i, i + class_start_index)
+                name = f"Класс_{original_label}"
                 class_names[name] = i
                 class_names_inv[i] = name
         elif isinstance(class_names_config, dict):
@@ -3175,7 +3423,9 @@ def main(config_module=None):
         data_result.y_test, y_pred_neutro, title="Нейтрософский ТС - Матрица ошибок", ax=axes[1]
     )
     fig.suptitle("Сравнение матриц ошибок", fontsize=16, fontweight='bold')
-    plt.tight_layout()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        plt.tight_layout()
     fig.savefig("plots_comparison/confusion_matrices_comparison.png", dpi=150, bbox_inches='tight')
     print("Сохранено: plots_comparison/confusion_matrices_comparison.png")
     
@@ -3208,7 +3458,9 @@ def main(config_module=None):
     axes[1].grid(True, alpha=0.3)
     
     fig.suptitle("Сравнение ROC-кривых", fontsize=16, fontweight='bold')
-    plt.tight_layout()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        plt.tight_layout()
     fig.savefig("plots_comparison/roc_curves_comparison.png", dpi=150, bbox_inches='tight')
     print("Сохранено: plots_comparison/roc_curves_comparison.png")
     
@@ -3243,7 +3495,9 @@ def main(config_module=None):
     axes[1].grid(True, alpha=0.3)
     
     fig.suptitle("Сравнение распределений уверенности", fontsize=16, fontweight='bold')
-    plt.tight_layout()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        plt.tight_layout()
     fig.savefig("plots_comparison/confidence_comparison.png", dpi=150, bbox_inches='tight')
     print("Сохранено: plots_comparison/confidence_comparison.png")
     
@@ -3263,9 +3517,164 @@ def main(config_module=None):
     ax.legend()
     ax.grid(True, alpha=0.3)
     
-    plt.tight_layout()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        plt.tight_layout()
     fig.savefig("plots_comparison/mean_confidence_per_class.png", dpi=150, bbox_inches='tight')
     print("Сохранено: plots_comparison/mean_confidence_per_class.png")
+    
+    # ========== ГРАФИК АРХИТЕКТУРЫ И ГИПЕРПАРАМЕТРОВ ==========
+    print("\n[12] Создание графика архитектуры и гиперпараметров...")
+    
+    # Информация о данных
+    data_info = {
+        'n_samples': len(data_result.X_train) + len(data_result.X_test),
+        'n_features': data_result.n_features,
+        'n_classes': data_result.n_classes,
+        'train_size': len(data_result.X_train),
+        'test_size': len(data_result.X_test)
+    }
+    
+    # Результаты обучения для классической модели
+    training_results_classical = {
+        'accuracy': accuracy,
+        'f1': f1_score(data_result.y_test, y_pred, average='weighted', zero_division=0),
+        'cv_accuracy': cv_results['accuracy_mean'],
+        'cv_std': cv_results['accuracy_std']
+    }
+    
+    # Результаты для нейтрософской модели
+    training_results_neutro = {
+        'accuracy': accuracy_neutro,
+        'f1': f1_score(data_result.y_test, y_pred_neutro, average='weighted', zero_division=0),
+        'cv_accuracy': cv_results_neutro['accuracy_mean'],
+        'cv_std': cv_results_neutro['accuracy_std']
+    }
+    
+    # График для классической модели
+    visualizer.plot_architecture_info(
+        hyper_config=HYPER_CONFIG,
+        model_config=config,
+        data_info=data_info,
+        training_results=training_results_classical,
+        title="Архитектура: Классический Такаги-Сугено",
+        save_path="plots_classical/architecture_info.png"
+    )
+    
+    # График для нейтрософской модели
+    visualizer.plot_architecture_info(
+        hyper_config=HYPER_CONFIG,
+        model_config=neutro_config,
+        data_info=data_info,
+        training_results=training_results_neutro,
+        title="Архитектура: Нейтрософский Такаги-Сугено",
+        save_path="plots_neutrosophic/architecture_info.png"
+    )
+    
+    # Общий сравнительный график архитектуры
+    fig = plt.figure(figsize=(18, 10))
+    gs = fig.add_gridspec(2, 3, hspace=0.35, wspace=0.3)
+    
+    # 1. Тип архитектуры
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.axis('off')
+    
+    if HYPER_CONFIG.use_boosting:
+        arch_name = "БУСТИНГ"
+        arch_params = f"Раундов: {HYPER_CONFIG.n_boosting_rounds}\nСкорость: {HYPER_CONFIG.boosting_learning_rate}"
+    elif HYPER_CONFIG.use_hierarchical:
+        arch_name = "ИЕРАРХИЧЕСКАЯ"
+        arch_params = f"Групп: {HYPER_CONFIG.n_groups}\nДвухуровневая"
+    elif HYPER_CONFIG.use_ensemble:
+        arch_name = "АНСАМБЛЬ"
+        arch_params = f"Моделей: {HYPER_CONFIG.n_estimators}\nРазнообразие: {HYPER_CONFIG.ensemble_diversity}"
+    else:
+        arch_name = "ОДИНОЧНАЯ"
+        arch_params = "Базовая модель\nТакаги-Сугено"
+    
+    ax1.text(0.5, 0.6, f"{arch_name}", transform=ax1.transAxes,
+             fontsize=24, ha='center', va='center', fontweight='bold')
+    ax1.text(0.5, 0.25, arch_params, transform=ax1.transAxes,
+             fontsize=12, ha='center', va='center')
+    ax1.set_title('Архитектура', fontsize=14, fontweight='bold')
+    
+    # 2. Сравнение точности
+    ax2 = fig.add_subplot(gs[0, 1])
+    models = ['Классический\nТС', 'Нейтрософский\nТС']
+    accuracies = [accuracy, accuracy_neutro]
+    colors_bar = ['#2ecc71', '#e74c3c']
+    bars = ax2.bar(models, accuracies, color=colors_bar, edgecolor='black')
+    for bar, acc in zip(bars, accuracies):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                f'{acc:.4f}', ha='center', va='bottom', fontsize=12, fontweight='bold')
+    ax2.set_ylim([0, 1.1])
+    ax2.set_ylabel('Точность')
+    ax2.set_title('Сравнение точности', fontsize=14, fontweight='bold')
+    ax2.grid(True, alpha=0.3, axis='y')
+    
+    # 3. Параметры модели
+    ax3 = fig.add_subplot(gs[0, 2])
+    ax3.axis('off')
+    params_text = f"""
+    Функций принадл.: {config.n_mfs}
+    Макс. правил: {config.max_rules}
+    Регуляризация: {config.regularization}
+    Температура: {config.temperature}
+    PCA: {'Да (' + str(int(HYPER_CONFIG.pca_variance*100)) + '%)' if HYPER_CONFIG.use_pca else 'Нет'}
+    """
+    ax3.text(0.5, 0.5, params_text.strip(), transform=ax3.transAxes,
+             fontsize=11, ha='center', va='center', fontfamily='monospace',
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow', alpha=0.8))
+    ax3.set_title('Гиперпараметры', fontsize=14, fontweight='bold')
+    
+    # 4. Данные
+    ax4 = fig.add_subplot(gs[1, 0])
+    sizes = [len(data_result.X_train), len(data_result.X_test)]
+    labels = [f'Обучение\n{sizes[0]}', f'Тест\n{sizes[1]}']
+    colors_pie = ['#3498db', '#e74c3c']
+    ax4.pie(sizes, labels=labels, colors=colors_pie, autopct='%1.1f%%',
+            startangle=90, explode=(0.02, 0.02))
+    ax4.text(0, 0, f'{sum(sizes)}\nвсего', ha='center', va='center', fontsize=10, fontweight='bold')
+    ax4.set_title(f'Данные ({data_result.n_features} признаков, {data_result.n_classes} классов)', 
+                  fontsize=14, fontweight='bold')
+    
+    # 5. CV результаты
+    ax5 = fig.add_subplot(gs[1, 1])
+    cv_models = ['Классич.\nТС', 'Нейтрософ.\nТС']
+    cv_means = [cv_results['accuracy_mean'], cv_results_neutro['accuracy_mean']]
+    cv_stds = [cv_results['accuracy_std'], cv_results_neutro['accuracy_std']]
+    x_pos = np.arange(len(cv_models))
+    bars = ax5.bar(x_pos, cv_means, yerr=cv_stds, capsize=5, color=colors_bar, edgecolor='black')
+    for bar, mean, std in zip(bars, cv_means, cv_stds):
+        ax5.text(bar.get_x() + bar.get_width()/2, bar.get_height() + std + 0.02,
+                f'{mean:.3f}+-{std:.3f}', ha='center', va='bottom', fontsize=10)
+    ax5.set_xticks(x_pos)
+    ax5.set_xticklabels(cv_models)
+    ax5.set_ylim([0, 1.15])
+    ax5.set_ylabel('CV Точность')
+    ax5.set_title('Кросс-валидация', fontsize=14, fontweight='bold')
+    ax5.grid(True, alpha=0.3, axis='y')
+    
+    # 6. Различия в предсказаниях
+    ax6 = fig.add_subplot(gs[1, 2])
+    n_total = len(data_result.y_test)
+    n_diff = len(diff)
+    n_agree = n_total - n_diff
+    sizes_pred = [n_agree, n_diff]
+    labels_pred = [f'Совпадают\n{n_agree} ({n_agree/n_total*100:.1f}%)', 
+                   f'Расходятся\n{n_diff} ({n_diff/n_total*100:.1f}%)']
+    colors_pred = ['#2ecc71', '#f39c12']
+    ax6.pie(sizes_pred, labels=labels_pred, colors=colors_pred, 
+            startangle=90, explode=(0, 0.05))
+    ax6.set_title('Согласованность моделей', fontsize=14, fontweight='bold')
+    
+    fig.suptitle(f'Обзор архитектуры: {arch_name} Такаги-Сугено', 
+                 fontsize=16, fontweight='bold')
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        plt.tight_layout()
+    fig.savefig("plots_comparison/architecture_overview.png", dpi=150, bbox_inches='tight')
+    print("Сохранено: plots_comparison/architecture_overview.png")
     
     plt.close('all')
     
@@ -3286,12 +3695,14 @@ def main(config_module=None):
     print("  - *_cv_results.png              : Результаты кросс-валидации")
     print("  - *_membership_functions.png    : Нечёткие функции принадлежности")
     print("  - *_neutrosophic_analysis.png   : Нейтрософский анализ неопределённости")
+    print("  - architecture_info.png         : Архитектура и гиперпараметры модели")
     print("\nСравнительные графики:")
     print("  - model_comparison.png          : Гистограмма сравнения метрик")
     print("  - confusion_matrices_comparison.png : Матрицы ошибок рядом")
     print("  - roc_curves_comparison.png     : Сравнение ROC-кривых")
     print("  - confidence_comparison.png     : Сравнение распределений уверенности")
     print("  - mean_confidence_per_class.png : Средняя уверенность по классам")
+    print("  - architecture_overview.png     : Обзор архитектуры и сравнение моделей")
     
     print("\n" + "=" * 70)
     print("ЗАВЕРШЕНО!")
