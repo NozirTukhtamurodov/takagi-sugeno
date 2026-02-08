@@ -252,7 +252,9 @@ def gaussian_membership_vectorized(
     # Broadcasting: x[:, None] -> (n_samples, 1), centers -> (n_mfs,)
     # Результат: (n_samples, n_mfs)
     diff_sq = (x[:, np.newaxis] - centers[np.newaxis, :]) ** 2
-    return np.exp(-diff_sq / (2 * sigmas[np.newaxis, :] ** 2))
+    # Защита от деления на 0: sigma_min гарантирует конечный результат
+    safe_sigmas = np.maximum(sigmas[np.newaxis, :], 1e-10)
+    return np.exp(-diff_sq / (2 * safe_sigmas ** 2))
 
 
 def generate_dynamic_intervals(
@@ -338,16 +340,33 @@ def solve_ridge_regression(
     Возвращает:
         Параметры (n_features, n_outputs)
     """
+    # Защита от NaN/Inf в Phi (может возникнуть при числовых проблемах)
+    if not np.all(np.isfinite(Phi)):
+        nan_count = np.sum(~np.isfinite(Phi))
+        print(f"    ⚠️  Обнаружено {nan_count} NaN/Inf в матрице Phi, заменено на 0")
+        Phi = np.nan_to_num(Phi, nan=0.0, posinf=0.0, neginf=0.0)
+    
     PhiT_Phi = Phi.T @ Phi
     PhiT_Y = Phi.T @ Y
     reg = regularization * np.eye(PhiT_Phi.shape[0])
     
     try:
         # Использование scipy.linalg.solve (быстрее и стабильнее np.linalg.solve)
-        return linalg.solve(PhiT_Phi + reg, PhiT_Y, assume_a='pos')
-    except linalg.LinAlgError:
+        result = linalg.solve(PhiT_Phi + reg, PhiT_Y, assume_a='pos')
+    except (linalg.LinAlgError, ValueError):
         # Запасной вариант - lstsq с регуляризацией
-        return linalg.lstsq(Phi, Y, cond=regularization)[0]
+        try:
+            result = linalg.lstsq(Phi, Y, cond=regularization)[0]
+        except (linalg.LinAlgError, ValueError):
+            # Последний вариант — numpy lstsq
+            result = np.linalg.lstsq(Phi, Y, rcond=regularization)[0]
+    
+    # Защита результата
+    if not np.all(np.isfinite(result)):
+        print(f"    ⚠️  NaN/Inf в параметрах консеквента, заменено на 0")
+        result = np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    return result
 
 
 # ============================================================================
@@ -434,7 +453,12 @@ class FuzzyPartition:
         
         # Вычисление центров и сигм как массивов (DRY - однократное вычисление)
         self.centers = np.linspace(min_val, max_val, n_mfs)
-        base_spread = (max_val - min_val) / (2 * max(n_mfs - 1, 1))
+        data_range = max_val - min_val
+        if data_range < 1e-10:
+            # Константный или почти константный столбец — все центры совпадают,
+            # задаём sigma=1.0 чтобы все MF давали ~одинаковые значения
+            data_range = 1.0
+        base_spread = data_range / (2 * max(n_mfs - 1, 1))
         self.sigmas = np.full(n_mfs, base_spread * overlap_factor)
     
     def fuzzify(self, x: np.ndarray) -> np.ndarray:
@@ -556,7 +580,11 @@ class ClassicalFiringStrategy(FuzzyInferenceStrategy):
         rule_indices: np.ndarray
     ) -> np.ndarray:
         """
-        Векторизованное вычисление силы срабатывания.
+        Вычисление силы срабатывания в log-пространстве.
+        
+        Произведение N значений принадлежности (t-норма) при большом N
+        вызывает числовой underflow. Решение: считаем сумму логарифмов,
+        затем применяем log-sum-exp трюк для устойчивой нормализации.
         
         Аргументы:
             memberships: (n_samples, n_inputs, n_mfs)
@@ -569,15 +597,22 @@ class ClassicalFiringStrategy(FuzzyInferenceStrategy):
         n_rules = len(rule_indices)
         n_inputs = memberships.shape[1]
         
-        # Инициализация единицами (для произведения t-нормы)
-        firing = np.ones((n_samples, n_rules), dtype=np.float64)
+        # Clamp memberships чтобы log не давал -inf
+        eps = 1e-300
         
-        # Векторизованное произведение по входам
+        # Суммируем логарифмы вместо умножения (log-space t-норма)
+        log_firing = np.zeros((n_samples, n_rules), dtype=np.float64)
         for input_idx in range(n_inputs):
             mf_indices = rule_indices[:, input_idx]  # (n_rules,)
-            # memberships[:, input_idx, :] -> (n_samples, n_mfs)
-            # Индексация по mf_indices для получения (n_samples, n_rules)
-            firing *= memberships[:, input_idx, mf_indices]
+            mu = memberships[:, input_idx, mf_indices]  # (n_samples, n_rules)
+            log_firing += np.log(np.maximum(mu, eps))
+        
+        # Log-sum-exp трюк для числовой стабильности:
+        # firing_i = exp(log_firing_i - max_j(log_firing_j))
+        max_log = np.max(log_firing, axis=1, keepdims=True)
+        # Защита от -inf (все правила имеют 0 принадлежность)
+        max_log = np.where(np.isfinite(max_log), max_log, 0.0)
+        firing = np.exp(log_firing - max_log)
         
         return firing
 
@@ -610,15 +645,21 @@ class NeutrosophicFiringStrategy(FuzzyInferenceStrategy):
         # Преобразование в нейтрософские значения
         T, I, F = self.handler.get_neutrosophic_values(memberships)
         
-        # Инициализация сил срабатывания
-        firing = np.ones((n_samples, n_rules), dtype=np.float64)
+        eps = 1e-300
+        
+        # Log-space t-норма для числовой стабильности (при большом n_inputs)
+        log_firing = np.zeros((n_samples, n_rules), dtype=np.float64)
         indeterminacy_sum = np.zeros((n_samples, n_rules), dtype=np.float64)
         
-        # Векторизованное произведение по входам
         for input_idx in range(n_inputs):
             mf_indices = rule_indices[:, input_idx]
-            firing *= T[:, input_idx, mf_indices]
+            log_firing += np.log(np.maximum(T[:, input_idx, mf_indices], eps))
             indeterminacy_sum += I[:, input_idx, mf_indices]
+        
+        # Log-sum-exp трюк
+        max_log = np.max(log_firing, axis=1, keepdims=True)
+        max_log = np.where(np.isfinite(max_log), max_log, 0.0)
+        firing = np.exp(log_firing - max_log)
         
         # Корректировка силы срабатывания по неопределённости
         avg_indeterminacy = indeterminacy_sum / n_inputs
@@ -2976,6 +3017,26 @@ def load_data(
     
     n_features_original = X.shape[1]
     
+    # === ОЧИСТКА: удаление строк с NaN / Inf ===
+    bad_rows = ~np.isfinite(X).all(axis=1)
+    if bad_rows.any():
+        n_bad = bad_rows.sum()
+        print(f"    ⚠️  Удалено {n_bad} строк с NaN/Inf в признаках")
+        X = X[~bad_rows]
+        y = y[~bad_rows]
+    
+    # === ОЧИСТКА: удаление константных столбцов (std=0 → NaN при стандартизации) ===
+    col_std = np.std(X, axis=0)
+    constant_mask = col_std < 1e-12
+    if constant_mask.any():
+        constant_cols = np.where(constant_mask)[0]
+        print(f"    ⚠️  Удалено {len(constant_cols)} константных столбцов (нулевая дисперсия): {constant_cols.tolist()}")
+        X = X[:, ~constant_mask]
+    
+    n_features_after_clean = X.shape[1]
+    if n_features_after_clean < n_features_original:
+        print(f"    Признаков после очистки: {n_features_original} → {n_features_after_clean}")
+    
     # Разделение данных
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
@@ -2986,6 +3047,13 @@ def load_data(
     X_train = scaler.fit_transform(X_train)
     X_test = scaler.transform(X_test)
     
+    # === ЗАЩИТА: проверка после StandardScaler ===
+    if not np.all(np.isfinite(X_train)) or not np.all(np.isfinite(X_test)):
+        bad_cols = ~(np.all(np.isfinite(X_train), axis=0) & np.all(np.isfinite(X_test), axis=0))
+        print(f"    ⚠️  Удалено {bad_cols.sum()} столбцов с NaN/Inf после стандартизации")
+        X_train = X_train[:, ~bad_cols]
+        X_test = X_test[:, ~bad_cols]
+    
     # Применение PCA (если включено)
     pca = None
     if hyper_config.use_pca:
@@ -2994,11 +3062,12 @@ def load_data(
         else:
             n_components = hyper_config.pca_variance
         
+        n_before_pca = X_train.shape[1]
         pca = PCA(n_components=n_components, random_state=random_state)
         X_train = pca.fit_transform(X_train)
         X_test = pca.transform(X_test)
         
-        print(f"    PCA: {n_features_original} → {X_train.shape[1]} признаков "
+        print(f"    PCA: {n_before_pca} → {X_train.shape[1]} признаков "
               f"({pca.explained_variance_ratio_.sum():.1%} дисперсии)")
     
     n_features = X_train.shape[1]
