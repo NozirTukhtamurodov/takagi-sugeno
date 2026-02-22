@@ -1075,10 +1075,13 @@ class TakagiSugenoClassifier:
             ),
         }
 
-    def save_kb_csv(self, prefix: str = "kb", feature_names: Optional[List[str]] = None) -> None:
+    def save_kb_csv(self, prefix: str = "kb", output_dir: str = ".", feature_names: Optional[List[str]] = None) -> None:
         """Сохранить табличные данные базы знаний в CSV файлы."""
+        import os
         if not self.is_fitted:
             raise RuntimeError("Модель не обучена. Вызовите fit() сначала.")
+
+        os.makedirs(output_dir, exist_ok=True)
 
         if feature_names is None:
             feature_names = [f"X{i}" for i in range(self._actual_n_inputs)]
@@ -1086,12 +1089,14 @@ class TakagiSugenoClassifier:
         mf_labels = ["VeryLow", "Low", "Medium", "High", "VeryHigh",
                      "ExtraHigh", "Max"][:self.config.n_mfs]
 
+        base = os.path.join(output_dir, prefix)
+
         # 1. Правила (индексы ФП для каждого входа)
         rule_cols = [f"{feature_names[i]}_фп" for i in range(self._actual_n_inputs)]
         df_rules = pd.DataFrame(self.rule_indices, columns=rule_cols)
         df_rules.insert(0, 'правило', [f"R{i+1}" for i in range(len(self.rule_indices))])
         df_rules['описание'] = self.get_rules_description(feature_names)
-        df_rules.to_csv(f"{prefix}_правила.csv", index=False, encoding="utf-8-sig")
+        df_rules.to_csv(f"{base}_правила.csv", index=False, encoding="utf-8-sig")
 
         # 2. Параметры консеквентов (линейные коэф. для каждого правила и класса)
         n_rules, n_classes, n_params = self.consequent_params.shape
@@ -1105,7 +1110,7 @@ class TakagiSugenoClassifier:
                     row[fname] = self.consequent_params[r, c, p]
                 rows.append(row)
         df_conseq = pd.DataFrame(rows)
-        df_conseq.to_csv(f"{prefix}_консеквенты.csv", index=False, encoding="utf-8-sig")
+        df_conseq.to_csv(f"{base}_консеквенты.csv", index=False, encoding="utf-8-sig")
 
         # 3. Нечёткие разбиения (центры и сигмы ФП для каждого входа)
         part_rows = []
@@ -1123,7 +1128,7 @@ class TakagiSugenoClassifier:
                     'макс_знач': p.max_val,
                 })
         df_parts = pd.DataFrame(part_rows)
-        df_parts.to_csv(f"{prefix}_разбиения.csv", index=False, encoding="utf-8-sig")
+        df_parts.to_csv(f"{base}_разбиения.csv", index=False, encoding="utf-8-sig")
 
         # 4. Нейтрософские интервалы (если есть)
         if self.config.use_neutrosophic and self.neutrosophic_handler is not None:
@@ -1133,9 +1138,9 @@ class TakagiSugenoClassifier:
                 columns=['T_мин', 'T_макс', 'I_мин', 'I_макс', 'F_мин', 'F_макс']
             )
             df_neutro.insert(0, 'уровень', [f"Уровень_{i}" for i in range(len(intervals))])
-            df_neutro.to_csv(f"{prefix}_нейтрософские_интервалы.csv", index=False, encoding="utf-8-sig")
+            df_neutro.to_csv(f"{base}_нейтрософские_интервалы.csv", index=False, encoding="utf-8-sig")
 
-        print(f"    CSV файлы базы знаний сохранены с префиксом '{prefix}_'")
+        print(f"    CSV файлы базы знаний сохранены в {output_dir}/")
 
     def save_model(self, path: str) -> None:
         """
@@ -3518,25 +3523,28 @@ def main(config_module=None):
     
     # Тест сохранения/загрузки
     print("\n[8] Тест сохранения/загрузки...")
-    model.save_model("ts_optimized_classical.pkl")
-    neutro_model.save_model("ts_optimized_neutro.pkl")
+    import os
+    os.makedirs("training_data", exist_ok=True)
+
+    model.save_model("training_data/ts_optimized_fuzzy.pkl")
+    neutro_model.save_model("training_data/ts_optimized_neutrosophic.pkl")
 
     # Сохранение баз знаний в JSON
     kb_classical = model.kb()
-    with open("kb_classical.json", "w", encoding="utf-8") as f:
+    with open("training_data/kb_fuzzy.json", "w", encoding="utf-8") as f:
         json.dump(kb_classical, f, indent=2, ensure_ascii=False)
-    print(f"    База знаний (классическая) сохранена в kb_classical.json")
+    print(f"    База знаний (нечёткая) сохранена в training_data/kb_fuzzy.json")
 
     kb_neutro = neutro_model.kb()
-    with open("kb_neutrosophic.json", "w", encoding="utf-8") as f:
+    with open("training_data/kb_neutrosophic.json", "w", encoding="utf-8") as f:
         json.dump(kb_neutro, f, indent=2, ensure_ascii=False)
-    print(f"    База знаний (нейтрософская) сохранена в kb_neutrosophic.json")
+    print(f"    База знаний (нейтрософская) сохранена в training_data/kb_neutrosophic.json")
 
     # Сохранение баз знаний в CSV
-    model.save_kb_csv(prefix="kb_classical")
-    neutro_model.save_kb_csv(prefix="kb_neutrosophic")
+    model.save_kb_csv(prefix="kb_fuzzy", output_dir="training_data")
+    neutro_model.save_kb_csv(prefix="kb_neutrosophic", output_dir="training_data")
 
-    loaded = TakagiSugenoClassifier.load_model("ts_optimized_classical.pkl")
+    loaded = TakagiSugenoClassifier.load_model("training_data/ts_optimized_fuzzy.pkl")
     loaded_pred = loaded.predict(data_result.X_test[:5])
     print(f"    Предсказания совпадают: {np.array_equal(y_pred[:5], loaded_pred)}")
     
@@ -3571,8 +3579,8 @@ def main(config_module=None):
         y_train=data_result.y_train,
         y_test=data_result.y_test,
         cv_results=cv_results,
-        output_dir="plots_classical",
-        model_name="Классический_ТС"
+        output_dir="plots/fuzzy",
+        model_name="Нечёткий_ТС"
     )
     
     # Визуализация нейтрософской модели
@@ -3585,7 +3593,7 @@ def main(config_module=None):
         y_train=data_result.y_train,
         y_test=data_result.y_test,
         cv_results=cv_results_neutro,
-        output_dir="plots_neutrosophic",
+        output_dir="plots/neutrosophic",
         model_name="Нейтрософский_ТС"
     )
     
@@ -3612,12 +3620,12 @@ def main(config_module=None):
     visualizer.plot_model_comparison(
         model_comparison,
         title="Классический vs Нейтрософский Такаги-Сугено",
-        save_path="plots_comparison/model_comparison.png"
+        save_path="plots/comparison/model_comparison.png"
     )
     
     # Создание матриц ошибок рядом
     import os
-    os.makedirs("plots_comparison", exist_ok=True)
+    os.makedirs("plots/comparison", exist_ok=True)
     
     fig, axes = plt.subplots(1, 2, figsize=(16, 7))
     visualizer.plot_confusion_matrix(
@@ -3630,8 +3638,8 @@ def main(config_module=None):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         plt.tight_layout()
-    fig.savefig("plots_comparison/confusion_matrices_comparison.png", dpi=150, bbox_inches='tight')
-    print("Сохранено: plots_comparison/confusion_matrices_comparison.png")
+    fig.savefig("plots/comparison/confusion_matrices_comparison.png", dpi=150, bbox_inches='tight')
+    print("Сохранено: plots/comparison/confusion_matrices_comparison.png")
     
     # Сравнение ROC-кривых рядом (микро-среднее для многоклассовой задачи)
     fig, axes = plt.subplots(1, 2, figsize=(16, 7))
@@ -3665,8 +3673,8 @@ def main(config_module=None):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         plt.tight_layout()
-    fig.savefig("plots_comparison/roc_curves_comparison.png", dpi=150, bbox_inches='tight')
-    print("Сохранено: plots_comparison/roc_curves_comparison.png")
+    fig.savefig("plots/comparison/roc_curves_comparison.png", dpi=150, bbox_inches='tight')
+    print("Сохранено: plots/comparison/roc_curves_comparison.png")
     
     # Сравнение распределений уверенности
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
@@ -3702,8 +3710,8 @@ def main(config_module=None):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         plt.tight_layout()
-    fig.savefig("plots_comparison/confidence_comparison.png", dpi=150, bbox_inches='tight')
-    print("Сохранено: plots_comparison/confidence_comparison.png")
+    fig.savefig("plots/comparison/confidence_comparison.png", dpi=150, bbox_inches='tight')
+    print("Сохранено: plots/comparison/confidence_comparison.png")
     
     # Средняя уверенность - общая статистика (для большого числа классов)
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -3724,8 +3732,8 @@ def main(config_module=None):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         plt.tight_layout()
-    fig.savefig("plots_comparison/mean_confidence_per_class.png", dpi=150, bbox_inches='tight')
-    print("Сохранено: plots_comparison/mean_confidence_per_class.png")
+    fig.savefig("plots/comparison/mean_confidence_per_class.png", dpi=150, bbox_inches='tight')
+    print("Сохранено: plots/comparison/mean_confidence_per_class.png")
     
     # ========== ГРАФИК АРХИТЕКТУРЫ И ГИПЕРПАРАМЕТРОВ ==========
     print("\n[12] Создание графика архитектуры и гиперпараметров...")
@@ -3762,7 +3770,7 @@ def main(config_module=None):
         data_info=data_info,
         training_results=training_results_classical,
         title="Архитектура: Классический Такаги-Сугено",
-        save_path="plots_classical/architecture_info.png"
+        save_path="plots/fuzzy/architecture_info.png"
     )
     
     # График для нейтрософской модели
@@ -3772,7 +3780,7 @@ def main(config_module=None):
         data_info=data_info,
         training_results=training_results_neutro,
         title="Архитектура: Нейтрософский Такаги-Сугено",
-        save_path="plots_neutrosophic/architecture_info.png"
+        save_path="plots/neutrosophic/architecture_info.png"
     )
     
     # Общий сравнительный график архитектуры
@@ -3877,18 +3885,19 @@ def main(config_module=None):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         plt.tight_layout()
-    fig.savefig("plots_comparison/architecture_overview.png", dpi=150, bbox_inches='tight')
-    print("Сохранено: plots_comparison/architecture_overview.png")
+    fig.savefig("plots/comparison/architecture_overview.png", dpi=150, bbox_inches='tight')
+    print("Сохранено: plots/comparison/architecture_overview.png")
     
     plt.close('all')
     
     print("\n" + "=" * 70)
     print("ВИЗУАЛИЗАЦИЯ ЗАВЕРШЕНА!")
     print("=" * 70)
-    print("\nСозданные папки с графиками:")
-    print("  - plots_classical/       : Визуализации классического Такаги-Сугено")
-    print("  - plots_neutrosophic/    : Визуализации нейтрософского Такаги-Сугено")
-    print("  - plots_comparison/      : Сравнительные визуализации")
+    print("\nСозданные папки:")
+    print("  - training_data/         : Модели (.pkl), базы знаний (.json, .csv)")
+    print("  - plots/fuzzy/           : Визуализации нечёткого Такаги-Сугено")
+    print("  - plots/neutrosophic/    : Визуализации нейтрософского Такаги-Сугено")
+    print("  - plots/comparison/      : Сравнительные визуализации")
     print("\nФайлы графиков:")
     print("  - *_metrics_summary.png         : Общий обзор метрик")
     print("  - *_confusion_matrix.png        : Тепловая карта матрицы ошибок")
