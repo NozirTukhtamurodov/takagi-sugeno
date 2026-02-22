@@ -30,6 +30,7 @@ from sklearn.metrics import (
 )
 import joblib
 import pickle
+import json
 from typing import Tuple, Optional, Dict, List, Protocol, Any
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -1016,7 +1017,64 @@ class TakagiSugenoClassifier:
             descriptions.append(f"Rule {idx + 1}: IF {antecedent} THEN linear_output")
         
         return descriptions
-    
+
+    def kb(self, feature_names: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Получить полную базу знаний обученной модели."""
+        if not self.is_fitted:
+            raise RuntimeError("Модель не обучена. Вызовите fit() сначала.")
+
+        if feature_names is None:
+            feature_names = [f"X{i}" for i in range(self._actual_n_inputs)]
+
+        mf_labels = ["VeryLow", "Low", "Medium", "High", "VeryHigh",
+                     "ExtraHigh", "Max"][:self.config.n_mfs]
+
+        return {
+            'конфигурация': {
+                'кол_входов': int(self._actual_n_inputs),
+                'кол_классов': int(self.config.n_classes),
+                'кол_фп': int(self.config.n_mfs),
+                'температура': float(self.config.temperature),
+                'регуляризация': float(self.config.regularization),
+                'нейтрософская': bool(self.config.use_neutrosophic),
+                'макс_правил': int(self.config.max_rules),
+                'коэф_перекрытия': float(self.config.overlap_factor),
+            },
+            'границы_данных': {
+                'минимумы': self.mins.tolist(),
+                'максимумы': self.maxs.tolist(),
+            },
+            'нечёткие_разбиения': [
+                {
+                    'индекс_входа': i,
+                    'имя_признака': feature_names[i] if i < len(feature_names) else f"X{i}",
+                    'кол_фп': int(p.n_mfs),
+                    'метки_фп': mf_labels,
+                    'центры': p.centers.tolist(),
+                    'сигмы': p.sigmas.tolist(),
+                    'мин_знач': float(p.min_val),
+                    'макс_знач': float(p.max_val),
+                }
+                for i, p in enumerate(self.partitions)
+            ],
+            'правила': {
+                'кол_правил': len(self.rule_indices),
+                'индексы_правил': self.rule_indices.tolist(),
+                'описания': self.get_rules_description(feature_names),
+            },
+            'параметры_консеквентов': self.consequent_params.tolist(),
+            'нейтрософская_логика': (
+                {'интервалы': self.neutrosophic_handler.intervals.tolist()}
+                if self.config.use_neutrosophic and self.neutrosophic_handler
+                else None
+            ),
+            'масштабирование': (
+                {'среднее': self.scaler.mean_.tolist(), 'масштаб': self.scaler.scale_.tolist()}
+                if self.scaler is not None
+                else None
+            ),
+        }
+
     def save_model(self, path: str) -> None:
         """
         Сохранение модели в файл (чистый pickle формат).
@@ -3400,7 +3458,18 @@ def main(config_module=None):
     print("\n[8] Тест сохранения/загрузки...")
     model.save_model("ts_optimized_classical.pkl")
     neutro_model.save_model("ts_optimized_neutro.pkl")
-    
+
+    # Сохранение баз знаний в JSON
+    kb_classical = model.kb()
+    with open("kb_classical.json", "w", encoding="utf-8") as f:
+        json.dump(kb_classical, f, indent=2, ensure_ascii=False)
+    print(f"    База знаний (классическая) сохранена в kb_classical.json")
+
+    kb_neutro = neutro_model.kb()
+    with open("kb_neutrosophic.json", "w", encoding="utf-8") as f:
+        json.dump(kb_neutro, f, indent=2, ensure_ascii=False)
+    print(f"    База знаний (нейтрософская) сохранена в kb_neutrosophic.json")
+
     loaded = TakagiSugenoClassifier.load_model("ts_optimized_classical.pkl")
     loaded_pred = loaded.predict(data_result.X_test[:5])
     print(f"    Предсказания совпадают: {np.array_equal(y_pred[:5], loaded_pred)}")
