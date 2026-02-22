@@ -1075,6 +1075,68 @@ class TakagiSugenoClassifier:
             ),
         }
 
+    def save_kb_csv(self, prefix: str = "kb", feature_names: Optional[List[str]] = None) -> None:
+        """Сохранить табличные данные базы знаний в CSV файлы."""
+        if not self.is_fitted:
+            raise RuntimeError("Модель не обучена. Вызовите fit() сначала.")
+
+        if feature_names is None:
+            feature_names = [f"X{i}" for i in range(self._actual_n_inputs)]
+
+        mf_labels = ["VeryLow", "Low", "Medium", "High", "VeryHigh",
+                     "ExtraHigh", "Max"][:self.config.n_mfs]
+
+        # 1. Правила (индексы ФП для каждого входа)
+        rule_cols = [f"{feature_names[i]}_фп" for i in range(self._actual_n_inputs)]
+        df_rules = pd.DataFrame(self.rule_indices, columns=rule_cols)
+        df_rules.insert(0, 'правило', [f"R{i+1}" for i in range(len(self.rule_indices))])
+        df_rules['описание'] = self.get_rules_description(feature_names)
+        df_rules.to_csv(f"{prefix}_правила.csv", index=False, encoding="utf-8-sig")
+
+        # 2. Параметры консеквентов (линейные коэф. для каждого правила и класса)
+        n_rules, n_classes, n_params = self.consequent_params.shape
+        rows = []
+        for r in range(n_rules):
+            for c in range(n_classes):
+                row = {'правило': f"R{r+1}", 'класс': c}
+                row['bias'] = self.consequent_params[r, c, 0]
+                for p in range(1, n_params):
+                    fname = feature_names[p-1] if (p-1) < len(feature_names) else f"X{p-1}"
+                    row[fname] = self.consequent_params[r, c, p]
+                rows.append(row)
+        df_conseq = pd.DataFrame(rows)
+        df_conseq.to_csv(f"{prefix}_консеквенты.csv", index=False, encoding="utf-8-sig")
+
+        # 3. Нечёткие разбиения (центры и сигмы ФП для каждого входа)
+        part_rows = []
+        for i, p in enumerate(self.partitions):
+            fname = feature_names[i] if i < len(feature_names) else f"X{i}"
+            for j in range(p.n_mfs):
+                label = mf_labels[j] if j < len(mf_labels) else f"MF{j}"
+                part_rows.append({
+                    'признак': fname,
+                    'индекс_входа': i,
+                    'фп': label,
+                    'центр': p.centers[j],
+                    'сигма': p.sigmas[j],
+                    'мин_знач': p.min_val,
+                    'макс_знач': p.max_val,
+                })
+        df_parts = pd.DataFrame(part_rows)
+        df_parts.to_csv(f"{prefix}_разбиения.csv", index=False, encoding="utf-8-sig")
+
+        # 4. Нейтрософские интервалы (если есть)
+        if self.config.use_neutrosophic and self.neutrosophic_handler is not None:
+            intervals = self.neutrosophic_handler.intervals
+            df_neutro = pd.DataFrame(
+                intervals,
+                columns=['T_мин', 'T_макс', 'I_мин', 'I_макс', 'F_мин', 'F_макс']
+            )
+            df_neutro.insert(0, 'уровень', [f"Уровень_{i}" for i in range(len(intervals))])
+            df_neutro.to_csv(f"{prefix}_нейтрософские_интервалы.csv", index=False, encoding="utf-8-sig")
+
+        print(f"    CSV файлы базы знаний сохранены с префиксом '{prefix}_'")
+
     def save_model(self, path: str) -> None:
         """
         Сохранение модели в файл (чистый pickle формат).
@@ -3469,6 +3531,10 @@ def main(config_module=None):
     with open("kb_neutrosophic.json", "w", encoding="utf-8") as f:
         json.dump(kb_neutro, f, indent=2, ensure_ascii=False)
     print(f"    База знаний (нейтрософская) сохранена в kb_neutrosophic.json")
+
+    # Сохранение баз знаний в CSV
+    model.save_kb_csv(prefix="kb_classical")
+    neutro_model.save_kb_csv(prefix="kb_neutrosophic")
 
     loaded = TakagiSugenoClassifier.load_model("ts_optimized_classical.pkl")
     loaded_pred = loaded.predict(data_result.X_test[:5])
