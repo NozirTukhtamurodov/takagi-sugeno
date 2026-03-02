@@ -46,6 +46,7 @@ class TakagiSugenoPredictor:
         neutrosophic_intervals: Optional[np.ndarray] = None,
         scaler_mean: Optional[np.ndarray] = None,
         scaler_scale: Optional[np.ndarray] = None,
+        feature_keep_mask: Optional[np.ndarray] = None,
     ):
         self.n_inputs = n_inputs
         self.n_classes = n_classes
@@ -62,6 +63,7 @@ class TakagiSugenoPredictor:
 
         self.scaler_mean = scaler_mean
         self.scaler_scale = scaler_scale
+        self.feature_keep_mask = feature_keep_mask
 
         # scikit-learn совместимый атрибут
         self.classes_ = np.arange(n_classes)
@@ -92,6 +94,9 @@ class TakagiSugenoPredictor:
             scaler_mean = np.array(d["scaler_mean"], dtype=np.float64)
             scaler_scale = np.array(d["scaler_scale"], dtype=np.float64)
 
+        fkm = d.get("feature_keep_mask")
+        feature_keep_mask = np.array(fkm, dtype=bool) if fkm is not None else None
+
         return cls(
             n_inputs=d["n_inputs"],
             n_classes=d["n_classes"],
@@ -105,6 +110,7 @@ class TakagiSugenoPredictor:
             neutrosophic_intervals=neutro,
             scaler_mean=scaler_mean,
             scaler_scale=scaler_scale,
+            feature_keep_mask=feature_keep_mask,
         )
 
     # ------------------------------------------------------------------
@@ -124,6 +130,14 @@ class TakagiSugenoPredictor:
         X = np.asarray(X, dtype=np.float64)
         if X.ndim == 1:
             X = X.reshape(1, -1)
+
+        # Remove constant columns that were dropped during training (per-model mask)
+        if self.feature_keep_mask is not None:
+            X = X[:, self.feature_keep_mask]
+
+        # Apply StandardScaler fitted during training
+        if self.scaler_mean is not None:
+            X = (X - self.scaler_mean) / self.scaler_scale
 
         scores = self._defuzzify(X)
         return scipy_softmax(scores / self.temperature, axis=1)

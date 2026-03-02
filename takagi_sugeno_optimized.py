@@ -705,7 +705,8 @@ class TakagiSugenoClassifier:
         self.mins: Optional[np.ndarray] = None
         self.maxs: Optional[np.ndarray] = None
         self.scaler: Optional[StandardScaler] = None
-        
+        self.feature_keep_mask: Optional[np.ndarray] = None
+
         self.is_fitted = False
         self._actual_n_inputs = config.n_inputs
     
@@ -1189,6 +1190,8 @@ class TakagiSugenoClassifier:
             # Scaler параметры (если есть)
             'scaler_mean': self.scaler.mean_.tolist() if self.scaler is not None else None,
             'scaler_scale': self.scaler.scale_.tolist() if self.scaler is not None else None,
+            # Маска признаков: какие столбцы оставить при инференсе (убраны константные)
+            'feature_keep_mask': self.feature_keep_mask.tolist() if self.feature_keep_mask is not None else None,
         }
         
         with open(path, 'wb') as f:
@@ -1227,6 +1230,11 @@ class TakagiSugenoClassifier:
             scaler.n_features_in_ = len(scaler.mean_)
             model.scaler = scaler
         
+        # Восстановление маски признаков
+        fkm = save_dict.get('feature_keep_mask')
+        if fkm is not None:
+            model.feature_keep_mask = np.array(fkm, dtype=bool)
+
         # Восстановление нейтрософского обработчика
         if config.use_neutrosophic and save_dict.get('neutrosophic_intervals') is not None:
             neutro_config = NeutrosophicConfig(
@@ -2901,6 +2909,7 @@ class DataResult:
     class_names_inv: Dict[int, str]
     pca: Optional[Any] = None           # PCA трансформер (если использовался)
     n_features_original: int = 0        # Исходное количество признаков до PCA
+    feature_keep_mask: Optional[np.ndarray] = None  # bool mask: True = keep column (per-model)
 
 
 def load_data(
@@ -3157,6 +3166,7 @@ def load_data(
         constant_cols = np.where(constant_mask)[0]
         print(f"    ⚠️  Удалено {len(constant_cols)} константных столбцов (нулевая дисперсия): {constant_cols.tolist()}")
         X = X[:, ~constant_mask]
+    feature_keep_mask = ~constant_mask  # True = keep; saved in model for inference-time preprocessing
     
     n_features_after_clean = X.shape[1]
     if n_features_after_clean < n_features_original:
@@ -3208,7 +3218,8 @@ def load_data(
         class_names=class_names,
         class_names_inv=class_names_inv,
         pca=pca,
-        n_features_original=n_features_original
+        n_features_original=n_features_original,
+        feature_keep_mask=feature_keep_mask,
     )
 
 
@@ -3274,6 +3285,7 @@ def main(config_module=None):
             use_neutrosophic=False
         )
         boosted.scaler = data_result.scaler
+        boosted.feature_keep_mask = data_result.feature_keep_mask
         boosted.fit(data_result.X_train, data_result.y_train)
         
         print("\n[3] Оценка бустинг классификатора...")
@@ -3285,6 +3297,7 @@ def main(config_module=None):
         print("\n[3.1] Для сравнения - обычная (одиночная) модель...")
         single_model = TakagiSugenoClassifier(config=config)
         single_model.scaler = data_result.scaler
+        single_model.feature_keep_mask = data_result.feature_keep_mask
         single_model.fit(data_result.X_train, data_result.y_train)
         y_pred_single = single_model.predict(data_result.X_test)
         accuracy_single = accuracy_score(data_result.y_test, y_pred_single)
@@ -3300,6 +3313,7 @@ def main(config_module=None):
             use_neutrosophic=False
         )
         hierarchical.scaler = data_result.scaler
+        hierarchical.feature_keep_mask = data_result.feature_keep_mask
         hierarchical.fit(data_result.X_train, data_result.y_train)
         
         print("\n[3] Оценка иерархического классификатора...")
@@ -3311,6 +3325,7 @@ def main(config_module=None):
         print("\n[3.1] Для сравнения - обычная (плоская) модель...")
         single_model = TakagiSugenoClassifier(config=config)
         single_model.scaler = data_result.scaler
+        single_model.feature_keep_mask = data_result.feature_keep_mask
         single_model.fit(data_result.X_train, data_result.y_train)
         y_pred_single = single_model.predict(data_result.X_test)
         accuracy_single = accuracy_score(data_result.y_test, y_pred_single)
@@ -3327,6 +3342,7 @@ def main(config_module=None):
             use_neutrosophic=False
         )
         ensemble.scaler = data_result.scaler
+        ensemble.feature_keep_mask = data_result.feature_keep_mask
         ensemble.fit(data_result.X_train, data_result.y_train)
         
         print("\n[3] Оценка ансамбля...")
@@ -3342,6 +3358,7 @@ def main(config_module=None):
         print("\n[3.1] Для сравнения - одиночная модель...")
         single_model = TakagiSugenoClassifier(config=config)
         single_model.scaler = data_result.scaler
+        single_model.feature_keep_mask = data_result.feature_keep_mask
         single_model.fit(data_result.X_train, data_result.y_train)
         y_pred_single = single_model.predict(data_result.X_test)
         accuracy_single = accuracy_score(data_result.y_test, y_pred_single)
@@ -3354,6 +3371,7 @@ def main(config_module=None):
         print("\n[2] Обучение классической модели...")
         model = TakagiSugenoClassifier(config=config)
         model.scaler = data_result.scaler
+        model.feature_keep_mask = data_result.feature_keep_mask
         model.fit(data_result.X_train, data_result.y_train)
         
         print("\n[3] Оценка...")
@@ -3487,6 +3505,7 @@ def main(config_module=None):
             use_neutrosophic=True
         )
         neutro_ensemble.scaler = data_result.scaler
+        neutro_ensemble.feature_keep_mask = data_result.feature_keep_mask
         neutro_ensemble.fit(data_result.X_train, data_result.y_train)
         
         print("\n[6] Оценка нейтрософского ансамбля...")
@@ -3496,11 +3515,13 @@ def main(config_module=None):
         
         neutro_model = TakagiSugenoClassifier(config=neutro_config)  # Для совместимости
         neutro_model.scaler = data_result.scaler
+        neutro_model.feature_keep_mask = data_result.feature_keep_mask
         neutro_model.fit(data_result.X_train, data_result.y_train)
     else:
         print("\n[5] Обучение нейтрософской модели...")
         neutro_model = TakagiSugenoClassifier(config=neutro_config)
         neutro_model.scaler = data_result.scaler
+        neutro_model.feature_keep_mask = data_result.feature_keep_mask
         neutro_model.fit(data_result.X_train, data_result.y_train)
         
         print("\n[6] Оценка нейтрософской модели...")
