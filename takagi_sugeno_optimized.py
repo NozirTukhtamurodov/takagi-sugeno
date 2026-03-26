@@ -2873,13 +2873,13 @@ class ModelVisualizer:
                 save_path=f"{output_dir}/{model_name}_cv_results.png"
             )
         
-        if model.partitions:
+        if getattr(model, 'partitions', None):
             figures['membership_funcs'] = self.plot_membership_functions(
                 model.partitions[0], input_name="Feature 0",
                 save_path=f"{output_dir}/{model_name}_membership_functions.png"
             )
-        
-        if isinstance(model.firing_strategy, NeutrosophicFiringStrategy):
+
+        if isinstance(getattr(model, 'firing_strategy', None), NeutrosophicFiringStrategy):
             conf_info = model.get_prediction_confidence(X_test)
             figures['neutrosophic_analysis'] = self.plot_neutrosophic_analysis(
                 conf_info, y_test, y_pred,
@@ -3287,12 +3287,12 @@ def main(config_module=None):
         boosted.scaler = data_result.scaler
         boosted.feature_keep_mask = data_result.feature_keep_mask
         boosted.fit(data_result.X_train, data_result.y_train)
-        
+
         print("\n[3] Оценка бустинг классификатора...")
         y_pred = boosted.predict(data_result.X_test)
         accuracy = accuracy_score(data_result.y_test, y_pred)
         print(f"    Точность бустинга на тесте: {accuracy:.4f}")
-        
+
         # Для сравнения - обычная модель
         print("\n[3.1] Для сравнения - обычная (одиночная) модель...")
         single_model = TakagiSugenoClassifier(config=config)
@@ -3303,8 +3303,9 @@ def main(config_module=None):
         accuracy_single = accuracy_score(data_result.y_test, y_pred_single)
         print(f"    Точность одиночной модели: {accuracy_single:.4f}")
         print(f"    Улучшение от бустинга: {(accuracy - accuracy_single)*100:+.2f}%")
-        
-        model = single_model  # Для совместимости с остальным кодом
+
+        model = boosted            # Используется для визуализации (predict/predict_proba)
+        base_model = single_model  # Используется для save_model/kb (только у TakagiSugenoClassifier)
     elif HYPER_CONFIG.use_hierarchical:
         print("\n[2] Обучение ИЕРАРХИЧЕСКОГО классификатора...")
         hierarchical = HierarchicalTakagiSugeno(
@@ -3315,12 +3316,12 @@ def main(config_module=None):
         hierarchical.scaler = data_result.scaler
         hierarchical.feature_keep_mask = data_result.feature_keep_mask
         hierarchical.fit(data_result.X_train, data_result.y_train)
-        
+
         print("\n[3] Оценка иерархического классификатора...")
         y_pred = hierarchical.predict(data_result.X_test)
         accuracy = accuracy_score(data_result.y_test, y_pred)
         print(f"    Точность иерархического на тесте: {accuracy:.4f}")
-        
+
         # Для сравнения - обычная модель
         print("\n[3.1] Для сравнения - обычная (плоская) модель...")
         single_model = TakagiSugenoClassifier(config=config)
@@ -3331,8 +3332,9 @@ def main(config_module=None):
         accuracy_single = accuracy_score(data_result.y_test, y_pred_single)
         print(f"    Точность обычной модели: {accuracy_single:.4f}")
         print(f"    Улучшение от иерархии: {(accuracy - accuracy_single)*100:+.2f}%")
-        
-        model = single_model  # Для совместимости с остальным кодом
+
+        model = hierarchical       # Используется для визуализации (predict/predict_proba)
+        base_model = single_model  # Используется для save_model/kb (только у TakagiSugenoClassifier)
     elif HYPER_CONFIG.use_ensemble:
         print("\n[2] Обучение АНСАМБЛЯ классических моделей...")
         ensemble = EnsembleTakagiSugeno(
@@ -3344,16 +3346,16 @@ def main(config_module=None):
         ensemble.scaler = data_result.scaler
         ensemble.feature_keep_mask = data_result.feature_keep_mask
         ensemble.fit(data_result.X_train, data_result.y_train)
-        
+
         print("\n[3] Оценка ансамбля...")
         y_pred = ensemble.predict(data_result.X_test)
         accuracy = accuracy_score(data_result.y_test, y_pred)
         print(f"    Точность ансамбля на тесте: {accuracy:.4f}")
-        
+
         # Согласие моделей
         agreements = ensemble.get_model_agreements(data_result.X_test)
         print(f"    Среднее согласие моделей: {agreements.mean():.2%}")
-        
+
         # Для сравнения - одиночная модель
         print("\n[3.1] Для сравнения - одиночная модель...")
         single_model = TakagiSugenoClassifier(config=config)
@@ -3364,8 +3366,9 @@ def main(config_module=None):
         accuracy_single = accuracy_score(data_result.y_test, y_pred_single)
         print(f"    Точность одиночной модели: {accuracy_single:.4f}")
         print(f"    Улучшение от ансамбля: +{(accuracy - accuracy_single)*100:.2f}%")
-        
-        model = single_model  # Для совместимости с остальным кодом
+
+        model = ensemble           # Используется для визуализации (predict/predict_proba)
+        base_model = single_model  # Используется для save_model/kb (только у TakagiSugenoClassifier)
     else:
         # Классическая одиночная модель
         print("\n[2] Обучение классической модели...")
@@ -3373,7 +3376,8 @@ def main(config_module=None):
         model.scaler = data_result.scaler
         model.feature_keep_mask = data_result.feature_keep_mask
         model.fit(data_result.X_train, data_result.y_train)
-        
+        base_model = model  # Одиночная модель — model и base_model одно и то же
+
         print("\n[3] Оценка...")
         y_pred = model.predict(data_result.X_test)
         accuracy = accuracy_score(data_result.y_test, y_pred)
@@ -3476,7 +3480,7 @@ def main(config_module=None):
     X_full = np.vstack([data_result.X_train, data_result.X_test])
     y_full = np.concatenate([data_result.y_train, data_result.y_test])
     
-    cv_results = model.cross_validate(X_full, y_full, n_folds=cv_folds)
+    cv_results = base_model.cross_validate(X_full, y_full, n_folds=cv_folds)
     print(f"    Точность CV: {cv_results['accuracy_mean']:.4f} ± {cv_results['accuracy_std']:.4f}")
     
     # ========== НЕЙТРОСОФСКИЙ АНСАМБЛЬ ==========
@@ -3547,11 +3551,11 @@ def main(config_module=None):
     import os
     os.makedirs("training_data", exist_ok=True)
 
-    model.save_model("training_data/ts_optimized_fuzzy.pkl")
+    base_model.save_model("training_data/ts_optimized_fuzzy.pkl")
     neutro_model.save_model("training_data/ts_optimized_neutrosophic.pkl")
 
     # Сохранение баз знаний в JSON
-    kb_classical = model.kb()
+    kb_classical = base_model.kb()
     with open("training_data/kb_fuzzy.json", "w", encoding="utf-8") as f:
         json.dump(kb_classical, f, indent=2, ensure_ascii=False)
     print(f"    База знаний (нечёткая) сохранена в training_data/kb_fuzzy.json")
@@ -3562,12 +3566,13 @@ def main(config_module=None):
     print(f"    База знаний (нейтрософская) сохранена в training_data/kb_neutrosophic.json")
 
     # Сохранение баз знаний в CSV
-    model.save_kb_csv(prefix="kb_fuzzy", output_dir="training_data")
+    base_model.save_kb_csv(prefix="kb_fuzzy", output_dir="training_data")
     neutro_model.save_kb_csv(prefix="kb_neutrosophic", output_dir="training_data")
 
     loaded = TakagiSugenoClassifier.load_model("training_data/ts_optimized_fuzzy.pkl")
     loaded_pred = loaded.predict(data_result.X_test[:5])
-    print(f"    Предсказания совпадают: {np.array_equal(y_pred[:5], loaded_pred)}")
+    base_pred = base_model.predict(data_result.X_test[:5])
+    print(f"    Предсказания совпадают: {np.array_equal(base_pred, loaded_pred)}")
     
     # Сравнение
     print("\n" + "=" * 70)
