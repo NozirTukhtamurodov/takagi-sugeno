@@ -169,13 +169,13 @@ class TakagiSugenoPredictor:
         return memberships
 
     def _compute_firing(self, memberships: np.ndarray) -> np.ndarray:
-        """Вычисление нормализованных сил срабатывания."""
+        """Вычисление нормализованных сил срабатывания (log-space, как при обучении)."""
         n_samples = memberships.shape[0]
         n_rules = len(self.rule_indices)
         n_inputs = memberships.shape[1]
+        eps = 1e-300
 
         if self.use_neutrosophic and self.neutrosophic_intervals is not None:
-            # --- Нейтрософская стратегия ---
             intervals = self.neutrosophic_intervals
             n_levels = len(intervals)
             levels = np.clip(
@@ -183,28 +183,32 @@ class TakagiSugenoPredictor:
                 0, n_levels - 1,
             )
             T = (intervals[levels, 0] + intervals[levels, 1]) / 2
-
-            firing = np.ones((n_samples, n_rules), dtype=np.float64)
-            indeterminacy_sum = np.zeros((n_samples, n_rules), dtype=np.float64)
-
             I = (intervals[levels, 2] + intervals[levels, 3]) / 2
 
+            log_firing = np.zeros((n_samples, n_rules), dtype=np.float64)
+            indeterminacy_sum = np.zeros((n_samples, n_rules), dtype=np.float64)
             for input_idx in range(n_inputs):
                 mf_indices = self.rule_indices[:, input_idx]
-                firing *= T[:, input_idx, mf_indices]
+                log_firing += np.log(np.maximum(T[:, input_idx, mf_indices], eps))
                 indeterminacy_sum += I[:, input_idx, mf_indices]
 
+            max_log = np.max(log_firing, axis=1, keepdims=True)
+            max_log = np.where(np.isfinite(max_log), max_log, 0.0)
+            firing = np.exp(log_firing - max_log)
+
             avg_indeterminacy = indeterminacy_sum / n_inputs
-            confidence_factor = 1 - avg_indeterminacy * 0.5
-            firing = firing * confidence_factor
+            firing = firing * (1 - avg_indeterminacy * 0.5)
         else:
-            # --- Классическая стратегия ---
-            firing = np.ones((n_samples, n_rules), dtype=np.float64)
+            log_firing = np.zeros((n_samples, n_rules), dtype=np.float64)
             for input_idx in range(n_inputs):
                 mf_indices = self.rule_indices[:, input_idx]
-                firing *= memberships[:, input_idx, mf_indices]
+                mu = memberships[:, input_idx, mf_indices]
+                log_firing += np.log(np.maximum(mu, eps))
 
-        # Нормализация
+            max_log = np.max(log_firing, axis=1, keepdims=True)
+            max_log = np.where(np.isfinite(max_log), max_log, 0.0)
+            firing = np.exp(log_firing - max_log)
+
         firing_sum = firing.sum(axis=1, keepdims=True) + 1e-8
         return firing / firing_sum
 
